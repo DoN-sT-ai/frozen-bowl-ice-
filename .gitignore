@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+installer-output/
+assets/icon.ico
+assets/icon.png
+.DS_Store
+*.log
+*.db-wal
+*.db-shm
+.env*
+!.env.example
+scratch/

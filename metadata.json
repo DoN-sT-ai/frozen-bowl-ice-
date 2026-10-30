@@ -1,0 +1,6 @@
+{
+  "name": "LedgerStore - Billing & Inventory",
+  "description": "Production billing and inventory management system with multi-role access, POS, receipt printing, and bill verification.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
