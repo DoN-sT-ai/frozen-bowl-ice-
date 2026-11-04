@@ -12,11 +12,13 @@ import { ProductService, CategoryService } from './services/productService.ts';
 import { InventoryService } from './services/inventoryService.ts';
 import { BillingService } from './services/billingService.ts';
 import { EmployeeService, ExpenseService } from './services/employeeService.ts';
+import { CashControlService } from './services/cashControlService.ts';
 import { VerificationService } from './services/verificationService.ts';
 import { DashboardService } from './services/dashboardService.ts';
 import { ReportService } from './services/reportService.ts';
 import { AuditService } from './services/auditService.ts';
 import { isSupabaseConfigured } from './supabaseClient.ts';
+import { SupabaseDb } from './supabaseDb.ts';
 import { LocalDb, DB_FILE_PATH } from './localDb.ts';
 import { inventoryLedgerRouter, PosCheckoutSchema } from './routes/inventoryLedgerRoutes.ts';
 import { inventoryLedgerEngine } from './services/inventoryLedgerEngine.ts';
@@ -536,6 +538,86 @@ app.delete('/api/sales/purge-all', requireAuth, requireAdmin, async (req: Authen
   }
 });
 
+// Customer Lookup by Phone (for auto-filling returning customers in POS)
+app.get('/api/customers/lookup', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const phone = ((req.query.phone as string) || '').trim();
+    if (!phone || phone.length < 4) {
+      return res.json({ found: false });
+    }
+    const token = (req.cookies?.session_token as string)
+      || (req.headers['x-session-token'] as string)
+      || (req.headers['authorization']?.replace(/^Bearer\s+/i, ''))
+      || (req.query?.token as string);
+
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const customer = await LocalDb.getCustomerByPhone(storeId, phone);
+    return res.json({
+      found: Boolean(customer),
+      customer: customer || undefined,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Fast autocomplete search for customer phone / name in POS billing
+app.get('/api/customers/search', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const q = ((req.query.q || req.query.query || '') as string).trim();
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 50) : 8;
+    const token = (req.cookies?.session_token as string)
+      || (req.headers['x-session-token'] as string)
+      || (req.headers['authorization']?.replace(/^Bearer\s+/i, ''))
+      || (req.query?.token as string);
+
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const suggestions = await LocalDb.searchCustomers(storeId, q, limit);
+    res.json(suggestions);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Comprehensive customer loyalty & repeat visitor analytics
+app.get('/api/customers/analytics', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const analytics = await LocalDb.getCustomerAnalytics(storeId);
+    res.json(analytics);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Customer purchase & bill history
+app.get('/api/customers/:phone/history', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const phone = req.params.phone;
+    const history = await LocalDb.getCustomerHistory(storeId, phone);
+    res.json(history);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
 // ==========================================
 // EMPLOYEE MANAGEMENT (ADMIN ONLY)
 // ==========================================
@@ -608,6 +690,130 @@ app.delete('/api/employees/:id', requireAuth, requireAdmin, async (req: Authenti
     res.json(result);
   } catch (err: any) {
     res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// Employee Tab Permissions
+app.get('/api/employees/:id/permissions', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const permissions = await EmployeeService.getEmployeePermissions(req.user!.store_id, req.params.id);
+    res.json({ userId: req.params.id, permissions });
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+app.put('/api/employees/:id/permissions', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { permissions } = req.body;
+    const result = await EmployeeService.updateEmployeePermissions(
+      req.user!.store_id,
+      req.user!.id,
+      req.user!.name,
+      req.params.id,
+      permissions
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// ==========================================
+// CASH CONTROL & DRAWER RECONCILIATION
+// ==========================================
+
+// Get current open session with live calculated expected cash and shift transactions
+app.get('/api/cash-control/current', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const data = await CashControlService.getCurrentSession(req.user!.store_id);
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Start shift / Open cash drawer
+app.post('/api/cash-control/open', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await CashControlService.openSession(
+      req.user!.store_id,
+      req.user!.id,
+      req.user!.name,
+      req.body
+    );
+    res.status(201).json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// Add cash into drawer (Float in)
+app.post('/api/cash-control/cash-in', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await CashControlService.addCashIn(
+      req.user!.store_id,
+      req.user!.id,
+      req.user!.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// Remove cash from drawer for expenses (Cash out - automatically logs to store expenses)
+app.post('/api/cash-control/cash-out', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await CashControlService.addCashOut(
+      req.user!.store_id,
+      req.user!.id,
+      req.user!.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// Close shift / End drawer session with counted denominations and variance
+app.post('/api/cash-control/close', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await CashControlService.closeSession(
+      req.user!.store_id,
+      req.user!.id,
+      req.user!.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// List past sessions history
+app.get('/api/cash-control/sessions', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const limit = Number(req.query.limit) || 50;
+    const list = await CashControlService.listSessions(req.user!.store_id, limit);
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Drilldown into a past session details + transactions
+app.get('/api/cash-control/sessions/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const data = await CashControlService.getSessionDetails(req.user!.store_id, req.params.id);
+    if (!data.session) {
+      return res.status(404).json({ error: { message: 'Cash drawer session not found' } });
+    }
+    res.json(data);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 
@@ -691,9 +897,9 @@ app.get('/api/reports/profit', requireAuth, requireAdmin, (req: AuthenticatedReq
   res.json(rep);
 });
 
-app.get('/api/reports/employees', requireAuth, requireAdmin, (req: AuthenticatedRequest, res: Response) => {
+app.get('/api/reports/employees', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   const { from, to } = req.query;
-  const rep = ReportService.getEmployeeReport(req.user!.store_id, {
+  const rep = await ReportService.getEmployeeReport(req.user!.store_id, {
     from: from as string,
     to: to as string,
   });
@@ -771,6 +977,54 @@ app.patch('/api/settings', requireAuth, requireAdmin, async (req: AuthenticatedR
     res.json(store);
   } catch (err: any) {
     res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// GET /api/settings/printer: Fetch persistent customized thermal printer & bill layout settings
+app.get('/api/settings/printer', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const token = (req.cookies?.session_token as string)
+      || (req.headers['x-session-token'] as string)
+      || (req.headers['authorization']?.replace(/^Bearer\s+/i, ''))
+      || (req.query?.token as string);
+
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const settings = await LocalDb.getPrinterSettings(storeId);
+    res.json({ success: true, settings });
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// POST /api/settings/printer: Persist customized thermal printer & bill layout settings to SQLite database
+app.post('/api/settings/printer', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const token = (req.cookies?.session_token as string)
+      || (req.headers['x-session-token'] as string)
+      || (req.headers['authorization']?.replace(/^Bearer\s+/i, ''))
+      || (req.query?.token as string);
+
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const saved = await LocalDb.savePrinterSettings(storeId, req.body);
+    res.json({ success: true, settings: saved });
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 
@@ -972,6 +1226,14 @@ app.post('/api/developer/config', requireAuth, requireDeveloper, async (req: Aut
     }
 
     fs.writeFileSync(envPath, currentEnv, 'utf8');
+    if (process.env.DATA_DIR) {
+      try {
+        const persistentEnvPath = path.join(process.env.DATA_DIR, '.env');
+        if (persistentEnvPath !== envPath) {
+          fs.writeFileSync(persistentEnvPath, currentEnv, 'utf8');
+        }
+      } catch (_) {}
+    }
 
     AuditService.log({
       storeId: req.user!.store_id,
@@ -1036,6 +1298,51 @@ app.post('/api/developer/test-connection', requireAuth, requireDeveloper, async 
   }
 });
 
+// ==========================================
+// MULTI-STORE MANAGEMENT (SUPABASE CLOUD)
+// ==========================================
+
+app.get('/api/developer/cloud-stores', requireAuth, requireDeveloper, async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const stores = await SupabaseDb.listStoresFromCloud();
+    res.json({ stores });
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+app.post('/api/developer/cloud-stores/toggle', requireAuth, requireDeveloper, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { storeIdOrName, active } = req.body;
+    if (!storeIdOrName) {
+      return res.status(400).json({ error: { message: 'storeIdOrName is required' } });
+    }
+
+    const newStatus = active ? 'ACTIVE' : 'STOPPED';
+    const updated = await SupabaseDb.updateStoreInCloud(storeIdOrName, {
+      active: Boolean(active),
+      status: newStatus,
+      is_blocked: !active,
+    });
+
+    AuditService.log({
+      storeId: 'global',
+      userId: req.user!.id,
+      userName: req.user!.name,
+      action: active ? 'STORE_ACTIVATED' : 'STORE_STOPPED',
+      entityType: 'STORE',
+      afterData: { storeIdOrName, status: newStatus },
+    });
+
+    res.json({
+      success: true,
+      updated,
+      message: `Store "${storeIdOrName}" is now ${newStatus}. ${active ? 'Users can log in.' : 'Users are now blocked from logging in.'}`,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
 
 // ==========================================
 // GLOBAL ERROR HANDLER

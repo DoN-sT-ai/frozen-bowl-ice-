@@ -1,6 +1,7 @@
 import React from 'react';
 import { Sale, Store } from '../../types';
 import { formatCurrency, formatDateTime, formatBillNumber } from '../../lib/utils';
+import { PrinterCustomizationSettings, getPrinterSettings } from '../../lib/printerService';
 import { QrCode as QrIcon } from 'lucide-react';
 
 interface ThermalReceiptContentProps {
@@ -9,6 +10,7 @@ interface ThermalReceiptContentProps {
   docType?: 'BILL' | 'INVOICE';
   qrCodeDataUrl?: string;
   isFullPagePdf?: boolean;
+  settings?: PrinterCustomizationSettings;
 }
 
 export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
@@ -17,53 +19,83 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
   docType = 'BILL',
   qrCodeDataUrl,
   isFullPagePdf = false,
+  settings,
 }) => {
+  const activeSettings = settings || getPrinterSettings();
   const isInvoice = docType === 'INVOICE';
   const isExempt = sale.gst_type === 'EXEMPT';
   const isInterState = sale.gst_type === 'INTER_STATE';
 
-  // Dynamic Document Title: Default is always BILL (RETAIL BILL / CASH BILL)
-  // Only TAX INVOICE when explicitly requested
-  const documentTitle = isInvoice
-    ? (isExempt ? 'BILL OF SUPPLY' : 'TAX INVOICE')
-    : (isExempt ? 'BILL OF SUPPLY' : (sale.payment_method === 'CASH' ? 'CASH BILL' : 'RETAIL BILL'));
+  // Dynamic Document Title based on customization mode
+  let documentTitle = 'RETAIL BILL';
+  if (activeSettings.docTitleMode === 'INVOICE' || isInvoice) {
+    documentTitle = isExempt ? 'BILL OF SUPPLY' : 'TAX INVOICE';
+  } else if (activeSettings.docTitleMode === 'CASH_MEMO') {
+    documentTitle = 'CASH MEMO';
+  } else if (activeSettings.docTitleMode === 'BILL') {
+    documentTitle = isExempt ? 'BILL OF SUPPLY' : 'RETAIL BILL';
+  } else {
+    documentTitle = isExempt ? 'BILL OF SUPPLY' : (sale.payment_method === 'CASH' ? 'CASH BILL' : 'RETAIL BILL');
+  }
 
   const billNumberFormatted = formatBillNumber(sale.bill_number, docType);
+  const storeDisplayName = activeSettings.headerStoreNameOverride?.trim() || store?.name || 'RETAIL STORE';
+  const fssaiToDisplay = activeSettings.showFssai ? (activeSettings.fssaiNumber || (store as any)?.fssai) : '';
+
+  // Typography density
+  const isCompact = activeSettings.density === 'compact';
+  const isLarge = activeSettings.density === 'large';
 
   return (
     <div
       style={{
         fontFamily: "-apple-system, BlinkMacSystemFont, 'Segoe UI', 'Nirmala UI', Roboto, 'Helvetica Neue', Arial, sans-serif",
       }}
-      className={`text-neutral-900 leading-tight bg-white ${
+      className={`text-neutral-900 leading-tight bg-white select-none ${
         isFullPagePdf
           ? 'w-full max-w-[720px] mx-auto p-6 md:p-8 text-xs sm:text-sm border border-neutral-300 rounded shadow-xs'
+          : isCompact
+          ? 'w-full text-[9px]'
+          : isLarge
+          ? 'w-full text-[11px]'
           : 'w-full text-[10px]'
       }`}
     >
       {/* Store Header */}
       <div className="text-center pb-2">
-        <div className={`font-bold tracking-tight uppercase text-neutral-900 ${isFullPagePdf ? 'text-xl' : 'text-sm'}`}>
-          {store?.name || 'RETAIL STORE'}
+        <div className={`font-bold tracking-tight uppercase text-neutral-900 ${isFullPagePdf ? 'text-xl' : isLarge ? 'text-base' : 'text-sm'}`}>
+          {storeDisplayName}
         </div>
-        {store?.address && (
+        {activeSettings.headerTagline && (
+          <div className="text-neutral-600 text-[9px] italic mt-0.5">
+            {activeSettings.headerTagline}
+          </div>
+        )}
+        {activeSettings.showStoreAddress && store?.address && (
           <div className={`text-neutral-700 whitespace-pre-line leading-tight mt-0.5 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
             {store.address}
           </div>
         )}
-        <div className={`text-neutral-700 mt-0.5 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
-          {store?.phone ? `Ph: ${store.phone}` : ''}
-          {store?.phone && store?.email ? ' · ' : ''}
-          {store?.email ? `Email: ${store.email}` : ''}
-        </div>
-        {store?.gstin && (
+        {((activeSettings.showPhone && store?.phone) || (activeSettings.showEmail && store?.email)) && (
+          <div className={`text-neutral-700 mt-0.5 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
+            {activeSettings.showPhone && store?.phone ? `Ph: ${store.phone}` : ''}
+            {activeSettings.showPhone && store?.phone && activeSettings.showEmail && store?.email ? ' · ' : ''}
+            {activeSettings.showEmail && store?.email ? `Email: ${store.email}` : ''}
+          </div>
+        )}
+        {activeSettings.showGstin && store?.gstin && (
           <div className={`font-bold text-neutral-900 mt-0.5 ${isFullPagePdf ? 'text-xs' : 'text-[10px]'}`}>
             GSTIN: {store.gstin}
           </div>
         )}
+        {fssaiToDisplay && (
+          <div className={`font-semibold text-neutral-800 mt-0.5 ${isFullPagePdf ? 'text-xs' : 'text-[9px]'}`}>
+            FSSAI Lic No: {fssaiToDisplay}
+          </div>
+        )}
       </div>
 
-      {/* Bill Title Banner (Default BILL, never Invoice unless explicitly selected) */}
+      {/* Bill Title Banner */}
       <div className={`border-t-2 border-b-2 border-dashed border-neutral-800 py-1 text-center font-bold tracking-wider uppercase text-neutral-900 ${
         isFullPagePdf ? 'text-sm my-2' : 'text-[10.5px] my-1'
       }`}>
@@ -76,21 +108,27 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
           <span className="text-neutral-600 font-medium">{isInvoice ? 'Invoice No:' : 'Bill No:'}</span>
           <span className="font-bold text-neutral-900 font-mono">{billNumberFormatted}</span>
         </div>
-        <div className="flex justify-between items-center">
-          <span className="text-neutral-600 font-medium">Date & Time:</span>
-          <span>{formatDateTime(sale.created_at)}</span>
-        </div>
-        <div className="flex justify-between items-center">
-          <span className="text-neutral-600 font-medium">Cashier / Billed By:</span>
-          <span>{sale.employee_name || 'Staff'}</span>
-        </div>
-        <div className="flex justify-between items-center">
-          <span className="text-neutral-600 font-medium">Payment Mode:</span>
-          <span className="font-bold text-neutral-900">{sale.payment_method}</span>
-        </div>
+        {activeSettings.showDateTime && (
+          <div className="flex justify-between items-center">
+            <span className="text-neutral-600 font-medium">Date & Time:</span>
+            <span>{formatDateTime(sale.created_at)}</span>
+          </div>
+        )}
+        {activeSettings.showCashierName && (
+          <div className="flex justify-between items-center">
+            <span className="text-neutral-600 font-medium">Cashier / Staff:</span>
+            <span>{sale.employee_name || 'Staff'}</span>
+          </div>
+        )}
+        {activeSettings.showPaymentMethod && (
+          <div className="flex justify-between items-center">
+            <span className="text-neutral-600 font-medium">Payment Mode:</span>
+            <span className="font-bold text-neutral-900">{sale.payment_method}</span>
+          </div>
+        )}
 
-        {/* Customer Details if present */}
-        {(sale.customer_name || sale.customer_phone || sale.customer_gstin) && (
+        {/* Customer Details if enabled & present */}
+        {activeSettings.showCustomerDetails && (sale.customer_name || sale.customer_phone || sale.customer_gstin) && (
           <div className="pt-1 mt-1 border-t border-dotted border-neutral-300 space-y-0.5">
             {sale.customer_name && (
               <div className="flex justify-between items-center">
@@ -138,9 +176,9 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
               <tr key={idx} className={`align-top ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
                 <td className="py-1 text-left pr-1" style={{ wordBreak: 'break-word' }}>
                   <div className="font-semibold text-neutral-900 leading-tight">
-                    {idx + 1}. {item.product_name_snapshot}
+                    {activeSettings.showItemIndex ? `${idx + 1}. ` : ''}{item.product_name_snapshot}
                   </div>
-                  {item.selected_modifiers && item.selected_modifiers.length > 0 && (
+                  {activeSettings.showModifiers && item.selected_modifiers && item.selected_modifiers.length > 0 && (
                     <div className="pl-2 pt-0.5 space-y-0.5 text-neutral-600 font-mono text-[8.5px]">
                       {item.selected_modifiers.map((m: any, mIdx: number) => (
                         <div key={mIdx}>
@@ -149,10 +187,11 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
                       ))}
                     </div>
                   )}
-                  {(item.hsn_snapshot || item.tax_rate > 0) && (
+                  {((activeSettings.showHsn && item.hsn_snapshot) || (activeSettings.showTaxRatePerItem && item.tax_rate > 0)) && (
                     <div className={`text-neutral-500 truncate mt-0.5 ${isFullPagePdf ? 'text-[11px]' : 'text-[8.5px]'}`}>
-                      {item.hsn_snapshot ? `HSN:${item.hsn_snapshot}` : ''}
-                      {item.tax_rate > 0 ? ` · GST:${item.tax_rate}%` : ''}
+                      {activeSettings.showHsn && item.hsn_snapshot ? `HSN:${item.hsn_snapshot}` : ''}
+                      {activeSettings.showHsn && item.hsn_snapshot && activeSettings.showTaxRatePerItem && item.tax_rate > 0 ? ' · ' : ''}
+                      {activeSettings.showTaxRatePerItem && item.tax_rate > 0 ? `GST:${item.tax_rate}%` : ''}
                     </div>
                   )}
                 </td>
@@ -172,7 +211,7 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
       </div>
 
       {/* GST Breakdown (if applicable) */}
-      {!isExempt && sale.tax > 0 && (
+      {activeSettings.showGstBreakdown && !isExempt && sale.tax > 0 && (
         <div className={`py-1.5 space-y-0.5 border-b border-dashed border-neutral-400 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
           <div className="font-bold text-neutral-500 uppercase tracking-wider mb-0.5 text-[9px]">
             Tax Breakdown (GST)
@@ -227,7 +266,7 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
                 <td className="text-right py-0.5 tabular-nums font-mono">+{formatCurrency(sale.tax)}</td>
               </tr>
             )}
-            {sale.discount > 0 && (
+            {activeSettings.showDiscountLine && sale.discount > 0 && (
               <tr>
                 <td className="text-left py-0.5 text-emerald-700 font-medium">Discount:</td>
                 <td className="text-right py-0.5 tabular-nums font-mono text-emerald-700 font-medium">
@@ -235,7 +274,7 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
                 </td>
               </tr>
             )}
-            {sale.round_off !== undefined && sale.round_off !== 0 && (
+            {activeSettings.showRoundOff && sale.round_off !== undefined && sale.round_off !== 0 && (
               <tr className="text-neutral-500 text-[9px]">
                 <td className="text-left py-0.5">Round Off:</td>
                 <td className="text-right py-0.5 tabular-nums font-mono">
@@ -254,10 +293,12 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
           <span className="tabular-nums font-mono">{formatCurrency(sale.total)}</span>
         </div>
 
-        <div className="flex justify-between text-neutral-600 pt-0.5 text-[9px]">
-          <span>Payment Status:</span>
-          <span className="font-bold text-emerald-800 uppercase">PAID VIA {sale.payment_method}</span>
-        </div>
+        {activeSettings.showPaymentMethod && (
+          <div className="flex justify-between text-neutral-600 pt-0.5 text-[9px]">
+            <span>Payment Status:</span>
+            <span className="font-bold text-emerald-800 uppercase">PAID VIA {sale.payment_method}</span>
+          </div>
+        )}
       </div>
 
       {sale.notes && (
@@ -269,7 +310,7 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
       {/* Verification QR Code Section */}
       <div className="pt-2 text-center">
         <div className="flex items-center justify-center gap-3">
-          {qrCodeDataUrl ? (
+          {activeSettings.showVerificationQr && qrCodeDataUrl ? (
             <img
               src={qrCodeDataUrl}
               alt="Bill QR"
@@ -277,25 +318,34 @@ export const ThermalReceiptContent: React.FC<ThermalReceiptContentProps> = ({
                 isFullPagePdf ? 'w-16 h-16' : 'w-11 h-11'
               }`}
             />
-          ) : (
+          ) : activeSettings.showVerificationQr ? (
             <div className={`border border-dashed border-neutral-300 flex items-center justify-center text-neutral-400 shrink-0 ${
               isFullPagePdf ? 'w-16 h-16' : 'w-11 h-11'
             }`}>
               <QrIcon className="w-5 h-5" />
             </div>
-          )}
+          ) : null}
           <div className="text-left leading-tight">
-            <div className={`font-bold tracking-tight text-neutral-900 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
-              Scan to Verify Authentic Bill
-            </div>
-            <div className="text-[8.5px] text-neutral-500 font-mono mt-0.5">
-              Token: {(sale.verification_token || '').slice(0, 16)}...
-            </div>
+            {activeSettings.showVerificationQr && (
+              <div className={`font-bold tracking-tight text-neutral-900 ${isFullPagePdf ? 'text-xs' : 'text-[9.5px]'}`}>
+                Scan to Verify Authentic Bill
+              </div>
+            )}
+            {activeSettings.showVerificationToken && sale.verification_token && (
+              <div className="text-[8.5px] text-neutral-500 font-mono mt-0.5">
+                Token: {(sale.verification_token || '').slice(0, 16)}...
+              </div>
+            )}
             <div className="text-[9px] text-neutral-800 font-bold uppercase mt-1 tracking-wider">
-              *** THANK YOU! VISIT AGAIN ***
+              {activeSettings.footerPrimaryMessage || '*** THANK YOU! VISIT AGAIN ***'}
             </div>
           </div>
         </div>
+        {activeSettings.footerSecondaryNote && (
+          <div className="text-[8px] text-neutral-500 italic mt-1.5">
+            {activeSettings.footerSecondaryNote}
+          </div>
+        )}
       </div>
     </div>
   );

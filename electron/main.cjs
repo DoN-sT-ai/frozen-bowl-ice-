@@ -2,6 +2,7 @@ const { app, BrowserWindow, Menu, dialog, shell, ipcMain, session } = require('e
 const path = require('path');
 const http = require('http');
 const fs = require('fs');
+const { initAutoUpdater } = require('./updater.cjs');
 
 if (process.env.ELECTRON_RUN_AS_NODE) {
   delete process.env.ELECTRON_RUN_AS_NODE;
@@ -50,49 +51,58 @@ if (!fs.existsSync(persistentDataDir)) {
 }
 
 // ─── Environment & Supabase Cloud Config Synchronization ──────────────────────
-const envCandidates = [
-  path.join(persistentDataDir, '.env'),
+function parseEnvFile(filePath) {
+  const result = {};
+  if (!fs.existsSync(filePath)) return result;
+  try {
+    const content = fs.readFileSync(filePath, 'utf8');
+    content.split(/\r?\n/).forEach((line) => {
+      const trimmed = line.trim();
+      if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
+        const idx = trimmed.indexOf('=');
+        const k = trimmed.slice(0, idx).trim();
+        let v = trimmed.slice(idx + 1).trim();
+        if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+          v = v.slice(1, -1);
+        }
+        result[k] = v;
+      }
+    });
+  } catch (_) {}
+  return result;
+}
+
+// 1. Authoritative bundled / developer project .env candidates
+const bundledCandidates = [
   path.join(process.resourcesPath, '.env'),
   path.resolve(__dirname, '..', '.env'),
   path.resolve(process.cwd(), '.env'),
 ];
+let bundledEnvPath = bundledCandidates.find((p) => fs.existsSync(p));
+const bundledConfig = bundledEnvPath ? parseEnvFile(bundledEnvPath) : {};
 
-for (const envPath of envCandidates) {
-  if (fs.existsSync(envPath)) {
+// 2. Persistent user data directory .env
+const persistentEnvPath = path.join(persistentDataDir, '.env');
+let persistentConfig = parseEnvFile(persistentEnvPath);
+
+// 3. Auto-heal: If persistent .env is missing OR has legacy Supabase URL, sync from bundled
+const legacyUrlDetected = persistentConfig.SUPABASE_URL && persistentConfig.SUPABASE_URL.includes('sxzaalvmkkdnczrtzitd');
+const urlMismatch = bundledConfig.SUPABASE_URL && persistentConfig.SUPABASE_URL && persistentConfig.SUPABASE_URL !== bundledConfig.SUPABASE_URL;
+
+if (!fs.existsSync(persistentEnvPath) || legacyUrlDetected || urlMismatch) {
+  if (bundledEnvPath) {
     try {
-      const content = fs.readFileSync(envPath, 'utf8');
-      content.split(/\r?\n/).forEach((line) => {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#') && trimmed.includes('=')) {
-          const idx = trimmed.indexOf('=');
-          const k = trimmed.slice(0, idx).trim();
-          let v = trimmed.slice(idx + 1).trim();
-          if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-            v = v.slice(1, -1);
-          }
-          if (!process.env[k]) {
-            process.env[k] = v;
-          }
-        }
-      });
-      const targetEnv = path.join(persistentDataDir, '.env');
-      if (!fs.existsSync(targetEnv)) {
-        try { fs.copyFileSync(envPath, targetEnv); } catch (_) {}
-      }
-      break;
+      fs.copyFileSync(bundledEnvPath, persistentEnvPath);
+      persistentConfig = parseEnvFile(persistentEnvPath);
     } catch (_) {}
   }
 }
 
-// Guarantee Supabase Cloud authentication credentials are never missing
-if (!process.env.SUPABASE_URL) {
-  process.env.SUPABASE_URL = 'https://sxzaalvmkkdnczrtzitd.supabase.co';
-}
-if (!process.env.SUPABASE_ANON_KEY) {
-  process.env.SUPABASE_ANON_KEY = 'sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM';
-}
-if (!process.env.SUPABASE_SERVICE_ROLE_KEY) {
-  process.env.SUPABASE_SERVICE_ROLE_KEY = 'sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM';
+// 4. Merge configs: bundled defaults, overlaid with persistent
+const mergedConfig = { ...bundledConfig, ...persistentConfig };
+
+for (const [k, v] of Object.entries(mergedConfig)) {
+  if (v) process.env[k] = v;
 }
 
 // ─── Starter Database Seeding ──────────────────────────────────────────────────
@@ -306,6 +316,39 @@ ipcMain.on('print-window', (event, options) => {
   }
 });
 
+// WhatsApp Share Handler: Attempts locally installed desktop app first, falls back to WhatsApp Web
+ipcMain.handle('open-whatsapp', async (_event, options) => {
+  const phone = options && options.phone ? String(options.phone).replace(/\D/g, '') : '';
+  const formattedPhone = phone.length === 10 ? `91${phone}` : phone;
+  const text = options && options.text ? options.text : '';
+  const encodedText = encodeURIComponent(text);
+
+  // 1. Native desktop app protocol (registered by Windows WhatsApp Desktop application)
+  const appUrl = formattedPhone
+    ? `whatsapp://send?phone=${formattedPhone}&text=${encodedText}`
+    : `whatsapp://send?text=${encodedText}`;
+
+  // 2. Web fallback URL
+  const webUrl = formattedPhone
+    ? `https://web.whatsapp.com/send?phone=${formattedPhone}&text=${encodedText}`
+    : `https://web.whatsapp.com/send?text=${encodedText}`;
+
+  try {
+    // Attempt opening locally installed desktop application first
+    await shell.openExternal(appUrl);
+    return { success: true, method: 'app' };
+  } catch (err) {
+    console.warn('[WhatsApp] Native desktop app not found or failed, falling back to WhatsApp Web:', err?.message);
+    try {
+      await shell.openExternal(webUrl);
+      return { success: true, method: 'web' };
+    } catch (webErr) {
+      console.error('[WhatsApp] Failed to open WhatsApp Web:', webErr);
+      return { success: false, error: webErr?.message };
+    }
+  }
+});
+
 // ─── Window & Menu ─────────────────────────────────────────────────────────────
 function createMenu() {
   const template = [
@@ -452,6 +495,11 @@ function createWindow() {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.show();
     }
+    try {
+      initAutoUpdater(mainWindow);
+    } catch (updaterErr) {
+      console.warn('[AutoUpdater] Failed to initialize:', updaterErr);
+    }
   });
 
   mainWindow.webContents.on('did-finish-load', () => {
@@ -537,12 +585,5 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
-  try {
-    if (session && session.defaultSession) {
-      session.defaultSession.clearStorageData({
-        storages: ['cookies', 'localstorage'],
-      }).catch(() => {});
-    }
-  } catch (_) {}
   stopServer();
 });

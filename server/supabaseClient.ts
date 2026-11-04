@@ -19,8 +19,8 @@ for (const envFile of envCandidates) {
   }
 }
 
-export const DEFAULT_SUPABASE_URL = 'https://sxzaalvmkkdnczrtzitd.supabase.co';
-export const DEFAULT_SUPABASE_KEY = 'sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM';
+export const DEFAULT_SUPABASE_URL = (process.env.SUPABASE_URL || '').trim();
+export const DEFAULT_SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || '').trim();
 
 export function getResolvedSupabaseConfig() {
   let url = (process.env.SUPABASE_URL || '').trim();
@@ -43,7 +43,7 @@ export function getResolvedSupabaseConfig() {
     } catch (_) {}
   }
 
-  // Fallback to project defaults
+  // Fallback to defaults if configured
   if (!url || url.includes('your-project-id')) {
     url = DEFAULT_SUPABASE_URL;
   }
@@ -52,9 +52,11 @@ export function getResolvedSupabaseConfig() {
   }
 
   // Synchronize process.env
-  process.env.SUPABASE_URL = url;
-  process.env.SUPABASE_ANON_KEY = key;
-  process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+  if (url) process.env.SUPABASE_URL = url;
+  if (key) {
+    process.env.SUPABASE_ANON_KEY = key;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+  }
 
   return { url, key };
 }

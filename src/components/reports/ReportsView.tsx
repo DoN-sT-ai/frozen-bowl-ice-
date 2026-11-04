@@ -42,7 +42,15 @@ export const ReportsView: React.FC = () => {
         setProfitData(res);
       } else if (activeTab === 'employees') {
         const res = await api.getEmployeeReport(params);
-        setEmployeeData(res);
+        const nonDevStaff = Array.isArray(res)
+          ? res.filter(
+              (emp: any) =>
+                emp.role !== 'DEVELOPER' &&
+                (emp.employeeName || '').toLowerCase() !== 'developer' &&
+                !(emp.email || '').toLowerCase().includes('developer')
+            )
+          : [];
+        setEmployeeData(nonDevStaff);
       }
     } catch (err) {
       console.error(err);
@@ -336,18 +344,32 @@ export const ReportsView: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-neutral-100">
-                {employeeData.map((emp, idx) => (
-                  <tr key={idx} className="hover:bg-neutral-50">
-                    <td className="py-2 px-3 font-medium text-neutral-900">{emp.employeeName}</td>
-                    <td className="py-2 px-3 font-mono text-neutral-500">{emp.email}</td>
-                    <td className="py-2 px-3 font-mono text-neutral-600 text-[11px]">{emp.role}</td>
-                    <td className="py-2 px-3 text-center font-mono tabular-nums">{emp.billsCount}</td>
-                    <td className="py-2 px-3 text-center font-mono tabular-nums">{emp.itemsSold}</td>
-                    <td className="py-2 px-3 text-right font-mono font-bold text-neutral-900 tabular-nums">
-                      {formatCurrency(emp.totalSales)}
+                {employeeData
+                  .filter(
+                    (emp: any) =>
+                      emp.role !== 'DEVELOPER' &&
+                      (emp.employeeName || '').toLowerCase() !== 'developer' &&
+                      !(emp.email || '').toLowerCase().includes('developer')
+                  )
+                  .map((emp, idx) => (
+                    <tr key={idx} className="hover:bg-neutral-50">
+                      <td className="py-2 px-3 font-medium text-neutral-900">{emp.employeeName}</td>
+                      <td className="py-2 px-3 font-mono text-neutral-500">{emp.email}</td>
+                      <td className="py-2 px-3 font-mono text-neutral-600 text-[11px]">{emp.role}</td>
+                      <td className="py-2 px-3 text-center font-mono tabular-nums">{emp.billsCount}</td>
+                      <td className="py-2 px-3 text-center font-mono tabular-nums">{emp.itemsSold}</td>
+                      <td className="py-2 px-3 text-right font-mono font-bold text-neutral-900 tabular-nums">
+                        {formatCurrency(emp.totalSales)}
+                      </td>
+                    </tr>
+                  ))}
+                {employeeData.length === 0 && (
+                  <tr>
+                    <td colSpan={6} className="py-8 text-center text-neutral-400">
+                      No staff performance data available for this store.
                     </td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>

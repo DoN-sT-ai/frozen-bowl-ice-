@@ -2,6 +2,37 @@ import { LocalDb } from './localDb.ts';
 import { supabase, isSupabaseConfigured } from './supabaseClient.ts';
 import type { User, Store } from './db.ts';
 
+export interface CloudStore {
+  id: string;
+  name: string;
+  code: string;
+  active: boolean;
+  status: string; // 'ACTIVE', 'STOPPED', 'INACTIVE', 'SUSPENDED'
+  is_blocked?: boolean;
+  plan_status?: string; // 'ACTIVE', 'EXPIRED', 'TRIAL'
+  plan_expires_at?: string;
+  address?: string;
+  phone?: string;
+  email?: string;
+  gstin?: string;
+  currency?: string;
+  timezone?: string;
+  invoice_prefix?: string;
+  is_stopped: boolean;
+  user_count?: number;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface CloudUser extends User {
+  store_name?: string | null;
+  store_status?: string | null;
+  store_active?: boolean;
+  is_blocked?: boolean;
+  is_store_stopped?: boolean;
+  status?: string;
+}
+
 export class SupabaseDb {
   private static checkSupabase() {
     if (!isSupabaseConfigured || !supabase) {
@@ -17,17 +48,21 @@ export class SupabaseDb {
   // Strictly no local fallback or local storage of user credentials.
   // ============================================================
 
-  static async getUserByEmail(emailOrUsername: string): Promise<(User & { is_blocked?: boolean; status?: string }) | null> {
+  static async getUserByEmail(emailOrUsername: string): Promise<CloudUser | null> {
     const client = this.checkSupabase();
     const clean = emailOrUsername.trim().toLowerCase();
 
     let queryResult: any;
     try {
-      queryResult = await client
-        .from('users')
-        .select('*')
-        .or(`email.ilike.${clean},name.ilike.${clean}`)
-        .maybeSingle();
+      const isEmail = clean.includes('@');
+      if (isEmail) {
+        queryResult = await client.from('users').select('*').ilike('email', clean).maybeSingle();
+      } else {
+        queryResult = await client.from('users').select('*').ilike('name', clean).maybeSingle();
+        if (!queryResult.data) {
+          queryResult = await client.from('users').select('*').ilike('email', clean).maybeSingle();
+        }
+      }
     } catch (networkErr: any) {
       console.warn('[Supabase] Offline network error:', networkErr?.message || networkErr);
       throw new Error('No internet connection. Please connect to the internet to log in to your store account, or use Developer offline mode.');
@@ -41,22 +76,33 @@ export class SupabaseDb {
 
     if (!data) return null;
 
-    const isBlocked =
+    const isUserBlocked =
       data.is_blocked === true ||
       data.active === false ||
-      data.status === 'BLOCKED' ||
-      data.status === 'INACTIVE';
+      String(data.status || '').toUpperCase() === 'BLOCKED' ||
+      String(data.status || '').toUpperCase() === 'INACTIVE' ||
+      String(data.status || '').toUpperCase() === 'SUSPENDED';
+
+    const isStoreStoppedOnUser =
+      data.store_active === false ||
+      data.is_store_active === false ||
+      ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED', 'EXPIRED'].includes(String(data.store_status || '').toUpperCase()) ||
+      String(data.plan_status || '').toUpperCase() === 'EXPIRED';
 
     return {
       id: data.id,
       store_id: data.store_id || 'a0000000-0000-0000-0000-000000000001',
+      store_name: data.store_name || null,
+      store_status: data.store_status || null,
+      store_active: data.store_active !== false,
       name: data.name || data.email,
       email: data.email,
       password_hash: data.password_hash || data.password || '',
       salt: data.salt || '',
       role: (['ADMIN', 'DEVELOPER'].includes(data.role?.toUpperCase()) ? data.role.toUpperCase() : 'EMPLOYEE') as 'ADMIN' | 'EMPLOYEE' | 'DEVELOPER',
-      active: !isBlocked,
-      is_blocked: isBlocked,
+      active: !isUserBlocked && !isStoreStoppedOnUser,
+      is_blocked: isUserBlocked,
+      is_store_stopped: isStoreStoppedOnUser,
       status: data.status,
       last_login_at: data.last_login_at,
       created_at: data.created_at || new Date().toISOString(),
@@ -64,7 +110,7 @@ export class SupabaseDb {
     };
   }
 
-  static async getUserById(id: string): Promise<User | null> {
+  static async getUserById(id: string): Promise<CloudUser | null> {
     const client = this.checkSupabase();
     const { data, error } = await client
       .from('users')
@@ -74,21 +120,34 @@ export class SupabaseDb {
 
     if (error || !data) return null;
 
-    const isBlocked =
+    const isUserBlocked =
       data.is_blocked === true ||
       data.active === false ||
-      data.status === 'BLOCKED' ||
-      data.status === 'INACTIVE';
+      String(data.status || '').toUpperCase() === 'BLOCKED' ||
+      String(data.status || '').toUpperCase() === 'INACTIVE' ||
+      String(data.status || '').toUpperCase() === 'SUSPENDED';
+
+    const isStoreStoppedOnUser =
+      data.store_active === false ||
+      data.is_store_active === false ||
+      ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED', 'EXPIRED'].includes(String(data.store_status || '').toUpperCase()) ||
+      String(data.plan_status || '').toUpperCase() === 'EXPIRED';
 
     return {
       id: data.id,
       store_id: data.store_id || 'a0000000-0000-0000-0000-000000000001',
+      store_name: data.store_name || null,
+      store_status: data.store_status || null,
+      store_active: data.store_active !== false,
       name: data.name || data.email,
       email: data.email,
       password_hash: data.password_hash || data.password || '',
       salt: data.salt || '',
       role: (['ADMIN', 'DEVELOPER'].includes(data.role?.toUpperCase()) ? data.role.toUpperCase() : 'EMPLOYEE') as 'ADMIN' | 'EMPLOYEE' | 'DEVELOPER',
-      active: !isBlocked,
+      active: !isUserBlocked && !isStoreStoppedOnUser,
+      is_blocked: isUserBlocked,
+      is_store_stopped: isStoreStoppedOnUser,
+      status: data.status,
       last_login_at: data.last_login_at,
       created_at: data.created_at || new Date().toISOString(),
       updated_at: data.updated_at || data.created_at || new Date().toISOString(),
@@ -122,7 +181,7 @@ export class SupabaseDb {
     }));
   }
 
-  static async createUser(user: User): Promise<User> {
+  static async createUser(user: User, storeName?: string): Promise<User> {
     const client = this.checkSupabase();
     const insertPayload: Record<string, any> = {
       id: user.id,
@@ -139,16 +198,23 @@ export class SupabaseDb {
       updated_at: user.updated_at,
     };
 
-    const { data, error } = await client
-      .from('users')
-      .insert(insertPayload)
-      .select()
-      .single();
-
-    if (error) {
-      throw new Error(`Failed to create employee in Supabase: ${error.message}`);
+    if (storeName) {
+      insertPayload.store_name = storeName;
     }
 
+    let insertRes = await client.from('users').insert(insertPayload).select().single();
+
+    // If store_name column doesn't exist yet in Supabase schema cache, gracefully retry without it
+    if (insertRes.error && insertPayload.store_name && (insertRes.error.code === 'PGRST204' || insertRes.error.message?.includes('store_name'))) {
+      delete insertPayload.store_name;
+      insertRes = await client.from('users').insert(insertPayload).select().single();
+    }
+
+    if (insertRes.error) {
+      throw new Error(`Failed to create employee in Supabase: ${insertRes.error.message}`);
+    }
+
+    const data = insertRes.data;
     return {
       id: data.id,
       store_id: data.store_id,
@@ -185,6 +251,228 @@ export class SupabaseDb {
     if (error) {
       throw new Error(`Failed to delete user in Supabase: ${error.message}`);
     }
+  }
+
+  // ============================================================
+  // MULTI-STORE MANAGEMENT & REMOTE STOP (SUPABASE CLOUD)
+  // Each shop (e.g. "Frozen Bowl", "2ice") is tracked in Supabase.
+  // Stopping a store immediately blocks all associated users.
+  // ============================================================
+
+  static async getStoreFromCloud(storeIdOrName: string): Promise<CloudStore | null> {
+    if (!isSupabaseConfigured || !supabase) return null;
+    const client = supabase;
+    const trimmed = (storeIdOrName || '').trim();
+    if (!trimmed) return null;
+
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+      let data: any = null;
+      let error: any = null;
+
+      if (isUuid) {
+        const res = await client.from('stores').select('*').eq('id', trimmed).maybeSingle();
+        data = res.data;
+        error = res.error;
+      }
+
+      if (!data) {
+        const resName = await client.from('stores').select('*').ilike('name', trimmed).maybeSingle();
+        if (resName.data) {
+          data = resName.data;
+          error = null;
+        } else if (!error) {
+          error = resName.error;
+        }
+      }
+
+      if (!data) {
+        const resCode = await client.from('stores').select('*').ilike('code', trimmed).maybeSingle();
+        if (resCode.data) {
+          data = resCode.data;
+          error = null;
+        }
+      }
+
+      if (error) {
+        // Table not present in Supabase schema cache yet
+        if (error.code === 'PGRST205' || error.message?.includes('schema cache')) {
+          return null;
+        }
+        console.warn('[Supabase] Notice querying stores table:', error.message);
+        return null;
+      }
+
+      if (!data) return null;
+
+      const isStopped =
+        data.active === false ||
+        data.is_active === false ||
+        data.is_blocked === true ||
+        ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED', 'CLOSED', 'DISABLED'].includes(String(data.status || '').toUpperCase()) ||
+        String(data.plan_status || '').toUpperCase() === 'EXPIRED' ||
+        (data.plan_expires_at && new Date(data.plan_expires_at).getTime() < Date.now());
+
+      return {
+        id: data.id,
+        name: data.name || trimmed,
+        code: data.code || 'STORE-01',
+        active: !isStopped,
+        status: data.status || (isStopped ? 'STOPPED' : 'ACTIVE'),
+        is_blocked: Boolean(data.is_blocked),
+        plan_status: data.plan_status || (isStopped ? 'EXPIRED' : 'ACTIVE'),
+        plan_expires_at: data.plan_expires_at,
+        address: data.address || '',
+        phone: data.phone || '',
+        email: data.email || '',
+        gstin: data.gstin || '',
+        currency: data.currency || 'INR',
+        timezone: data.timezone || 'Asia/Kolkata',
+        invoice_prefix: data.invoice_prefix || 'INV-',
+        is_stopped: isStopped,
+        created_at: data.created_at,
+        updated_at: data.updated_at,
+      };
+    } catch (err: any) {
+      console.warn('[Supabase] Exception checking store in cloud:', err?.message || err);
+      return null;
+    }
+  }
+
+  static async listStoresFromCloud(): Promise<CloudStore[]> {
+    if (!isSupabaseConfigured || !supabase) return [];
+    const client = supabase;
+
+    // 1. Try querying dedicated 'stores' table
+    try {
+      const { data, error } = await client
+        .from('stores')
+        .select('*')
+        .order('name', { ascending: true });
+
+      if (!error && Array.isArray(data) && data.length > 0) {
+        return data.map((s: any) => {
+          const isStopped =
+            s.active === false ||
+            s.is_active === false ||
+            s.is_blocked === true ||
+            ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED', 'CLOSED', 'DISABLED'].includes(String(s.status || '').toUpperCase()) ||
+            String(s.plan_status || '').toUpperCase() === 'EXPIRED';
+
+          return {
+            id: s.id,
+            name: s.name,
+            code: s.code || 'STORE-01',
+            active: !isStopped,
+            status: s.status || (isStopped ? 'STOPPED' : 'ACTIVE'),
+            is_blocked: Boolean(s.is_blocked),
+            plan_status: s.plan_status || (isStopped ? 'EXPIRED' : 'ACTIVE'),
+            plan_expires_at: s.plan_expires_at,
+            address: s.address || '',
+            phone: s.phone || '',
+            email: s.email || '',
+            gstin: s.gstin || '',
+            currency: s.currency || 'INR',
+            timezone: s.timezone || 'Asia/Kolkata',
+            invoice_prefix: s.invoice_prefix || 'INV-',
+            is_stopped: isStopped,
+            created_at: s.created_at,
+            updated_at: s.updated_at,
+          };
+        });
+      }
+    } catch (_) {}
+
+    // 2. Fallback: Aggregate unique stores from 'users' table if 'stores' table is not created yet
+    try {
+      const { data: users, error: uErr } = await client.from('users').select('store_id, store_name, status, is_blocked, active, store_status, store_active');
+      if (!uErr && Array.isArray(users)) {
+        const storeMap = new Map<string, CloudStore>();
+        for (const u of users) {
+          const key = u.store_name || u.store_id || 'Frozen Bowl';
+          if (!storeMap.has(key)) {
+            const isStopped =
+              u.store_active === false ||
+              ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED'].includes(String(u.store_status || '').toUpperCase());
+            storeMap.set(key, {
+              id: u.store_id || key,
+              name: u.store_name || (u.store_id === 'STORE-01' ? 'Frozen Bowl' : key),
+              code: (u.store_name || key).toUpperCase().replace(/\s+/g, '-').slice(0, 10),
+              active: !isStopped,
+              status: isStopped ? 'STOPPED' : 'ACTIVE',
+              is_stopped: isStopped,
+              user_count: 1,
+            });
+          } else {
+            const existing = storeMap.get(key)!;
+            existing.user_count = (existing.user_count || 0) + 1;
+          }
+        }
+        return Array.from(storeMap.values());
+      }
+    } catch (_) {}
+
+    return [];
+  }
+
+  static async updateStoreInCloud(storeIdOrName: string, updates: Partial<CloudStore>): Promise<boolean> {
+    const client = this.checkSupabase();
+    const isStopped = updates.status === 'STOPPED' || updates.active === false || updates.is_blocked === true;
+    const now = new Date().toISOString();
+
+    let storeUpdated = false;
+
+    // 1. Update in 'stores' table if it exists
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(storeIdOrName);
+      let query = client.from('stores').update({
+        active: !isStopped,
+        status: isStopped ? 'STOPPED' : 'ACTIVE',
+        is_blocked: Boolean(isStopped),
+        plan_status: isStopped ? 'EXPIRED' : 'ACTIVE',
+        updated_at: now,
+      });
+
+      if (isUuid) {
+        query = query.eq('id', storeIdOrName);
+      } else {
+        query = query.ilike('name', storeIdOrName);
+      }
+
+      const { data, error } = await query.select();
+      if (!error && data && data.length > 0) {
+        storeUpdated = true;
+      }
+    } catch (_) {}
+
+    // 2. Also propagate store status to associated 'users' in Supabase
+    // This guarantees stopping a store blocks its users even before the stores table is populated
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(storeIdOrName);
+      const userUpdates: Record<string, any> = {
+        store_status: isStopped ? 'STOPPED' : 'ACTIVE',
+        store_active: !isStopped,
+        updated_at: now,
+      };
+
+      if (isUuid) {
+        const res = await client.from('users').update(userUpdates).eq('store_id', storeIdOrName).select();
+        if (!res.error && res.data && res.data.length > 0) storeUpdated = true;
+      } else {
+        const res = await client.from('users').update(userUpdates).ilike('store_name', storeIdOrName).select();
+        if (!res.error && res.data && res.data.length > 0) storeUpdated = true;
+      }
+    } catch (_) {}
+
+    return storeUpdated;
+  }
+
+  static async isStoreStoppedInCloud(storeIdOrName: string): Promise<boolean> {
+    const store = await this.getStoreFromCloud(storeIdOrName);
+    if (store) {
+      return store.is_stopped;
+    }
+    return false;
   }
 
   // ============================================================

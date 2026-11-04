@@ -9,6 +9,10 @@ assets/icon.png
 *.log
 *.db-wal
 *.db-shm
+*.tmp
+pending-update/
+supabase/.temp/
+.temp/
 .env*
 !.env.example
 scratch/

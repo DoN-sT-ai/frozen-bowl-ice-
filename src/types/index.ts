@@ -20,6 +20,7 @@ export interface User {
   active: boolean;
   last_login_at?: string;
   created_at: string;
+  permissions?: string[];
 }
 
 export interface Category {
@@ -295,4 +296,132 @@ export interface VerificationResponse {
     voidReason?: string;
     voidedAt?: string;
   };
+}
+
+export interface DenominationCounts {
+  '500'?: number;
+  '200'?: number;
+  '100'?: number;
+  '50'?: number;
+  '20'?: number;
+  '10'?: number;
+  '5'?: number;
+  '2'?: number;
+  '1'?: number;
+  [key: string]: number | undefined;
+}
+
+export interface CashDrawerSession {
+  id: string;
+  store_id: string;
+  opened_by?: string;
+  opened_by_name: string;
+  opened_at: string;
+  opening_amount: number;
+  opening_denominations_json?: string;
+  opening_notes?: string;
+  closed_by?: string;
+  closed_by_name?: string;
+  closed_at?: string;
+  closing_amount?: number;
+  closing_denominations_json?: string;
+  closing_notes?: string;
+  expected_amount: number;
+  cash_sales_amount: number;
+  cash_in_amount: number;
+  cash_out_amount: number;
+  difference?: number;
+  status: 'OPEN' | 'CLOSED';
+  created_at: string;
+  updated_at: string;
+}
+
+export type CashDrawerTransactionType = 'OPENING_FLOAT' | 'CASH_IN' | 'CASH_OUT' | 'SALE' | 'REFUND';
+
+export interface CashDrawerTransaction {
+  id: string;
+  session_id: string;
+  store_id: string;
+  type: CashDrawerTransactionType;
+  amount: number;
+  category?: string;
+  reason?: string;
+  reference_id?: string;
+  performed_by?: string;
+  performed_by_name: string;
+  notes?: string;
+  created_at: string;
+}
+
+export interface CashControlCurrentData {
+  session: CashDrawerSession | null;
+  transactions: CashDrawerTransaction[];
+  lastClosedSession?: CashDrawerSession | null;
+}
+
+export interface CashCloseReconciliation {
+  session: CashDrawerSession;
+  reconciliation: {
+    expectedAmount: number;
+    closingAmount: number;
+    difference: number;
+    status: 'BALANCED' | 'SURPLUS' | 'SHORTAGE';
+  };
+}
+
+export interface CustomerSuggestion {
+  customer_name: string;
+  customer_phone: string;
+  customer_gstin?: string;
+  visit_count: number;
+  total_spend: number;
+  last_visit: string;
+}
+
+export interface CustomerAnalyticsSummary {
+  total_unique_customers: number;
+  repeat_customers: number;
+  repeat_rate: number;
+  total_spend: number;
+  avg_spend_per_customer: number;
+  visits_this_week: number;
+  visits_last_week: number;
+  new_customers_this_week: number;
+}
+
+export interface CustomerAnalyticsItem {
+  customer_name: string;
+  customer_phone: string;
+  customer_gstin?: string;
+  total_visits: number;
+  total_spend: number;
+  avg_bill_value: number;
+  first_visit: string;
+  last_visit: string;
+  tier: 'VIP' | 'REGULAR' | 'NEW';
+  favorite_items: string[];
+}
+
+export interface CustomerWeeklyTrend {
+  date: string;
+  day_name: string;
+  visit_count: number;
+  revenue: number;
+}
+
+export interface CustomerAnalyticsResponse {
+  summary: CustomerAnalyticsSummary;
+  customers: CustomerAnalyticsItem[];
+  weekly_trends: CustomerWeeklyTrend[];
+}
+
+export interface CustomerHistoryResponse {
+  customer: {
+    customer_name: string;
+    customer_phone: string;
+    customer_gstin?: string;
+    total_visits: number;
+    total_spend: number;
+  } | null;
+  sales: Sale[];
 }

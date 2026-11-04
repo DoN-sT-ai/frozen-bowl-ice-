@@ -183,6 +183,68 @@ export interface BillSequence {
   last_number: number;
 }
 
+export interface DenominationCounts {
+  '500'?: number;
+  '200'?: number;
+  '100'?: number;
+  '50'?: number;
+  '20'?: number;
+  '10'?: number;
+  '5'?: number;
+  '2'?: number;
+  '1'?: number;
+  [key: string]: number | undefined;
+}
+
+export interface CashDrawerSession {
+  id: string;
+  store_id: string;
+  opened_by?: string;
+  opened_by_name: string;
+  opened_at: string;
+  opening_amount: number;
+  opening_denominations_json?: string;
+  opening_notes?: string;
+  closed_by?: string;
+  closed_by_name?: string;
+  closed_at?: string;
+  closing_amount?: number;
+  closing_denominations_json?: string;
+  closing_notes?: string;
+  expected_amount: number;
+  cash_sales_amount: number;
+  cash_in_amount: number;
+  cash_out_amount: number;
+  difference?: number;
+  status: 'OPEN' | 'CLOSED';
+  created_at: string;
+  updated_at: string;
+}
+
+export type CashDrawerTransactionType = 'OPENING_FLOAT' | 'CASH_IN' | 'CASH_OUT' | 'SALE' | 'REFUND';
+
+export interface CashDrawerTransaction {
+  id: string;
+  session_id: string;
+  store_id: string;
+  type: CashDrawerTransactionType;
+  amount: number;
+  category?: string;
+  reason?: string;
+  reference_id?: string;
+  performed_by?: string;
+  performed_by_name: string;
+  notes?: string;
+  created_at: string;
+}
+
+export interface EmployeeTabPermissions {
+  user_id: string;
+  store_id: string;
+  permissions: string[];
+  updated_at: string;
+}
+
 export interface DatabaseSchema {
   stores: Store[];
   users: User[];
@@ -194,6 +256,9 @@ export interface DatabaseSchema {
   expenses: Expense[];
   audit_logs: AuditLog[];
   bill_sequences: BillSequence[];
+  cash_drawer_sessions?: CashDrawerSession[];
+  cash_drawer_transactions?: CashDrawerTransaction[];
+  employee_tab_permissions?: EmployeeTabPermissions[];
 }
 
 // ============================================================

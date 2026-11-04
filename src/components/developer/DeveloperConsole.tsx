@@ -17,7 +17,11 @@ import {
   Sliders,
   ExternalLink,
   Shield,
+  CloudDownload,
+  ArrowUpCircle,
+  Cpu,
 } from 'lucide-react';
+import type { UpdateStatusData, UpdateProgressData } from '../../electron';
 
 export const DeveloperConsole: React.FC = () => {
   const [config, setConfig] = useState<any>(null);
@@ -26,6 +30,16 @@ export const DeveloperConsole: React.FC = () => {
   const [saving, setSaving] = useState<boolean>(false);
   const [testResult, setTestResult] = useState<any>(null);
   const [feedbackMsg, setFeedbackMsg] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
+
+  // Wireless Updates state
+  const [appVersionInfo, setAppVersionInfo] = useState<{ version: string; isPackaged: boolean; feedUrl?: string }>({
+    version: '2.1.5',
+    isPackaged: false,
+  });
+  const [updaterStatus, setUpdaterStatus] = useState<UpdateStatusData | null>(null);
+  const [updaterProgress, setUpdaterProgress] = useState<UpdateProgressData | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState<boolean>(false);
+  const [installingUpdate, setInstallingUpdate] = useState<boolean>(false);
 
   // Form states
   const [supabaseUrl, setSupabaseUrl] = useState<string>('');
@@ -47,6 +61,58 @@ export const DeveloperConsole: React.FC = () => {
     } finally {
       setLoading(false);
     }
+  };
+
+  useEffect(() => {
+    if (window.electronAPI?.updater) {
+      window.electronAPI.updater.getVersion().then((v) => {
+        if (v) setAppVersionInfo(v);
+      }).catch(() => {});
+
+      const unsubStatus = window.electronAPI.updater.onStatus((data) => {
+        setUpdaterStatus(data);
+        setCheckingUpdate(false);
+      });
+
+      const unsubProgress = window.electronAPI.updater.onProgress((data) => {
+        setUpdaterProgress(data);
+      });
+
+      return () => {
+        if (unsubStatus) unsubStatus();
+        if (unsubProgress) unsubProgress();
+      };
+    }
+  }, []);
+
+  const handleCheckForUpdates = async () => {
+    if (!window.electronAPI?.updater?.check) {
+      setUpdaterStatus({
+        status: 'dev-mode',
+        message: 'Wireless updates require running inside the packaged Electron desktop app.',
+      });
+      return;
+    }
+    setCheckingUpdate(true);
+    setUpdaterStatus({ status: 'checking', message: 'Checking Supabase for new releases...' });
+    try {
+      const res = await window.electronAPI.updater.check();
+      if (!res.success && res.error) {
+        setUpdaterStatus({ status: 'error', message: res.error });
+      } else if (res.isDev) {
+        setUpdaterStatus({ status: 'dev-mode', message: res.message || 'Development mode active.' });
+      }
+    } catch (err: any) {
+      setUpdaterStatus({ status: 'error', message: err.message });
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleInstallDownloadedUpdate = async () => {
+    if (!window.electronAPI?.updater?.install) return;
+    setInstallingUpdate(true);
+    await window.electronAPI.updater.install();
   };
 
   useEffect(() => {
@@ -305,6 +371,118 @@ export const DeveloperConsole: React.FC = () => {
               )}
             </div>
           )}
+        </div>
+
+        {/* Section: Wireless Cloud Updates (electron-updater + Supabase) */}
+        <div className="bg-neutral-900/90 border border-neutral-800 rounded-xl p-5 shadow-sm space-y-4">
+          <div className="flex items-center justify-between pb-3 border-b border-neutral-800">
+            <div className="flex items-center gap-2">
+              <CloudDownload className="w-4 h-4 text-blue-400" />
+              <h3 className="font-semibold text-xs text-white uppercase tracking-wider font-mono">
+                Wireless Cloud Updates (electron-updater &amp; Supabase Storage)
+              </h3>
+            </div>
+            <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-blue-950 text-blue-300 border border-blue-800">
+              v{appVersionInfo.version} {appVersionInfo.isPackaged ? '(Packaged)' : '(Dev)'}
+            </span>
+          </div>
+
+          <p className="text-xs text-neutral-400">
+            Windows installer files (<code>.exe</code>), <code>latest.yml</code>, and differential blockmap files are stored securely in the private Supabase Storage bucket <code>app-updates</code>. Signed download URLs are generated on-the-fly via the Supabase Edge Function, verifying cryptographic SHA-512 hashes before installation.
+          </p>
+
+          {/* Live Status Banner */}
+          {updaterStatus && (
+            <div className={`p-3 rounded-lg border text-xs font-mono flex items-start gap-2.5 ${
+              updaterStatus.status === 'downloaded'
+                ? 'bg-emerald-950/40 border-emerald-800 text-emerald-300'
+                : updaterStatus.status === 'available' || updaterStatus.status === 'checking'
+                ? 'bg-blue-950/40 border-blue-800 text-blue-300'
+                : updaterStatus.status === 'error'
+                ? 'bg-amber-950/40 border-amber-800 text-amber-300'
+                : 'bg-neutral-950 border-neutral-800 text-neutral-300'
+            }`}>
+              {updaterStatus.status === 'downloaded' ? (
+                <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+              ) : updaterStatus.status === 'available' || updaterStatus.status === 'checking' ? (
+                <RefreshCw className="w-4 h-4 text-blue-400 shrink-0 mt-0.5 animate-spin" />
+              ) : (
+                <Radio className="w-4 h-4 text-neutral-400 shrink-0 mt-0.5" />
+              )}
+              <div className="flex-1 space-y-1">
+                <div>{updaterStatus.message}</div>
+                {updaterStatus.version && (
+                  <div className="text-[11px] opacity-80">Version: v{updaterStatus.version}</div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* Download Progress Bar */}
+          {updaterProgress && updaterProgress.percent > 0 && updaterProgress.percent < 100 && (
+            <div className="p-3 bg-neutral-950 rounded-lg border border-neutral-800 space-y-2">
+              <div className="flex justify-between text-xs font-mono text-neutral-400">
+                <span>Downloading update package...</span>
+                <span>
+                  {updaterProgress.bytesPerSecond > 0 && `${(updaterProgress.bytesPerSecond / (1024 * 1024)).toFixed(1)} MB/s • `}
+                  {updaterProgress.percent}% ({(updaterProgress.transferred / (1024 * 1024)).toFixed(1)} / {(updaterProgress.total / (1024 * 1024)).toFixed(1)} MB)
+                </span>
+              </div>
+              <div className="w-full bg-neutral-800 rounded-full h-2 overflow-hidden">
+                <div
+                  className="bg-blue-500 h-2 rounded-full transition-all duration-150 ease-out"
+                  style={{ width: `${updaterProgress.percent}%` }}
+                />
+              </div>
+            </div>
+          )}
+
+          {/* Action Buttons */}
+          <div className="flex items-center justify-between pt-1">
+            <div className="text-[11px] text-neutral-500 font-mono">
+              Auto-check: Every 45 minutes + on startup
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleCheckForUpdates}
+                disabled={checkingUpdate}
+                className="px-3 py-1.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg text-xs font-mono flex items-center gap-1.5 transition cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${checkingUpdate ? 'animate-spin' : ''}`} />
+                <span>{checkingUpdate ? 'Checking...' : 'Check for Updates'}</span>
+              </button>
+
+              {updaterStatus?.status === 'downloaded' && (
+                <button
+                  onClick={handleInstallDownloadedUpdate}
+                  disabled={installingUpdate}
+                  className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-bold font-mono flex items-center gap-1.5 transition cursor-pointer shadow-sm"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${installingUpdate ? 'animate-spin' : ''}`} />
+                  <span>{installingUpdate ? 'Installing...' : 'Restart & Apply Update'}</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Pipeline Details */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-2.5 text-[11px] font-mono pt-2 border-t border-neutral-800/80">
+            <div className="p-2.5 rounded-lg bg-neutral-950 border border-neutral-800/60">
+              <span className="text-neutral-500 block">Edge Function Channel:</span>
+              <span className="text-neutral-300 truncate block" title={appVersionInfo.feedUrl || 'functions/v1/app-updates'}>
+                {appVersionInfo.feedUrl || '/functions/v1/app-updates'}
+              </span>
+            </div>
+            <div className="p-2.5 rounded-lg bg-neutral-950 border border-neutral-800/60">
+              <span className="text-neutral-500 block">Supabase Storage:</span>
+              <span className="text-neutral-300">bucket: app-updates (Private)</span>
+            </div>
+            <div className="p-2.5 rounded-lg bg-neutral-950 border border-neutral-800/60">
+              <span className="text-neutral-500 block">Database Safety:</span>
+              <span className="text-emerald-400">userData (Never Overwritten)</span>
+            </div>
+          </div>
         </div>
 
         {/* Section 2: Local & Cloud Database Architecture */}

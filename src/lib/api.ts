@@ -9,6 +9,14 @@ import {
   DashboardSummary,
   VerificationResponse,
   AuditLog,
+  CashControlCurrentData,
+  CashDrawerSession,
+  CashDrawerTransaction,
+  CashCloseReconciliation,
+  DenominationCounts,
+  CustomerSuggestion,
+  CustomerAnalyticsResponse,
+  CustomerHistoryResponse,
 } from '../types';
 
 class ApiClient {
@@ -259,6 +267,29 @@ class ApiClient {
     });
   }
 
+  async lookupCustomer(phone: string) {
+    return this.request<{
+      found: boolean;
+      customer?: { customer_name: string; customer_phone: string; customer_gstin?: string };
+    }>(`/api/customers/lookup?phone=${encodeURIComponent(phone)}`);
+  }
+
+  async searchCustomers(query: string, limit = 8) {
+    return this.request<CustomerSuggestion[]>(
+      `/api/customers/search?q=${encodeURIComponent(query)}&limit=${limit}`
+    );
+  }
+
+  async getCustomerAnalytics() {
+    return this.request<CustomerAnalyticsResponse>('/api/customers/analytics');
+  }
+
+  async getCustomerHistory(phone: string) {
+    return this.request<CustomerHistoryResponse>(
+      `/api/customers/${encodeURIComponent(phone)}/history`
+    );
+  }
+
   // Employees
   async getEmployees() {
     return this.request<User[]>('/api/employees');
@@ -343,6 +374,17 @@ class ApiClient {
   async updateSettings(payload: Partial<Store>) {
     return this.request<Store>('/api/settings', {
       method: 'PATCH',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async getPrinterSettings() {
+    return this.request<{ success: boolean; settings: any | null }>('/api/settings/printer');
+  }
+
+  async savePrinterSettings(payload: any) {
+    return this.request<{ success: boolean; settings: any }>('/api/settings/printer', {
+      method: 'POST',
       body: JSON.stringify(payload),
     });
   }
@@ -534,6 +576,100 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(payload || {}),
     });
+  }
+
+  async getCloudStores() {
+    return this.request<{
+      stores: Array<{
+        id: string;
+        name: string;
+        code: string;
+        active: boolean;
+        status: string;
+        is_stopped: boolean;
+        user_count?: number;
+      }>;
+    }>('/api/developer/cloud-stores');
+  }
+
+  async toggleCloudStore(storeIdOrName: string, active: boolean) {
+    return this.request<{
+      success: boolean;
+      updated: boolean;
+      message: string;
+    }>('/api/developer/cloud-stores/toggle', {
+      method: 'POST',
+      body: JSON.stringify({ storeIdOrName, active }),
+    });
+  }
+  // Employee Tab Permissions
+  async getEmployeePermissions(employeeId: string) {
+    return this.request<{ userId: string; permissions: string[] }>(`/api/employees/${employeeId}/permissions`);
+  }
+
+  async updateEmployeePermissions(employeeId: string, permissions: string[]) {
+    return this.request<{ success: boolean; permissions: string[] }>(`/api/employees/${employeeId}/permissions`, {
+      method: 'PUT',
+      body: JSON.stringify({ permissions }),
+    });
+  }
+
+  // Cash Control & Shift Sessions
+  async getCurrentCashDrawerSession() {
+    return this.request<CashControlCurrentData>('/api/cash-control/current');
+  }
+
+  async openCashDrawerSession(payload: {
+    openingAmount: number;
+    denominations?: DenominationCounts;
+    notes?: string;
+  }) {
+    return this.request<{ session: CashDrawerSession; transaction: CashDrawerTransaction }>('/api/cash-control/open', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async addCashIn(payload: {
+    amount: number;
+    reason?: string;
+    notes?: string;
+  }) {
+    return this.request<{ session: CashDrawerSession; transaction: CashDrawerTransaction }>('/api/cash-control/cash-in', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async addCashOut(payload: {
+    amount: number;
+    category?: string;
+    reason?: string;
+    notes?: string;
+  }) {
+    return this.request<{ session: CashDrawerSession; transaction: CashDrawerTransaction; expense?: any }>('/api/cash-control/cash-out', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async closeCashDrawerSession(payload: {
+    closingAmount: number;
+    denominations?: DenominationCounts;
+    notes?: string;
+  }) {
+    return this.request<CashCloseReconciliation>('/api/cash-control/close', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  }
+
+  async getCashDrawerSessions(limit = 50) {
+    return this.request<CashDrawerSession[]>(`/api/cash-control/sessions?limit=${limit}`);
+  }
+
+  async getCashDrawerSessionDetails(sessionId: string) {
+    return this.request<{ session: CashDrawerSession; transactions: CashDrawerTransaction[] }>(`/api/cash-control/sessions/${sessionId}`);
   }
 }
 

@@ -16,7 +16,11 @@ import { AuditLogsView } from './components/audit/AuditLogsView';
 import { SettingsView } from './components/settings/SettingsView';
 import { DeveloperConsole } from './components/developer/DeveloperConsole';
 import { PublicVerificationPage } from './components/verify/PublicVerificationPage';
-import { X, Shield, Settings, Wallet, FileBarChart2, Users, ScrollText, Code } from 'lucide-react';
+import { UpdateNotificationBanner } from './components/common/UpdateNotificationBanner';
+import { CashControlView } from './components/cash/CashControlView';
+import { CustomersView } from './components/customers/CustomersView';
+import { initPrinterSettingsSync } from './lib/printerService';
+import { X, Shield, Settings, Wallet, FileBarChart2, Users, ScrollText, Code, Banknote, UserCheck } from 'lucide-react';
 
 const MainLayout: React.FC = () => {
   const { user, loading, isAdmin, isDeveloper, quickLogin } = useAuth();
@@ -25,8 +29,16 @@ const MainLayout: React.FC = () => {
   const [verifyToken, setVerifyToken] = useState<string>('');
   const [showMobileMore, setShowMobileMore] = useState<boolean>(false);
 
+  // Compute allowed tabs for the current user
+  const allowedTabIds = isAdmin
+    ? ['billing', 'inventory', 'movements', 'sales', 'cash_control', 'customers', 'dashboard', 'expenses', 'reports', 'employees', 'audit', 'settings', ...(isDeveloper ? ['developer'] : [])]
+    : user?.permissions && user.permissions.length > 0
+    ? user.permissions
+    : ['billing', 'inventory', 'sales', 'movements', 'cash_control', 'customers'];
+
   // Check query parameter for ?verify=TOKEN on mount
   useEffect(() => {
+    initPrinterSettingsSync();
     const urlParams = new URLSearchParams(window.location.search);
     const token = urlParams.get('verify');
     if (token) {
@@ -35,21 +47,20 @@ const MainLayout: React.FC = () => {
     }
   }, []);
 
-  // Sync tab permissions: if non-admin tries to open admin tabs, reset to billing
+  // Sync tab permissions: if employee tries to open unauthorized tab, redirect to first allowed tab
   useEffect(() => {
-    const adminOnlyTabs = ['dashboard', 'expenses', 'reports', 'employees', 'audit', 'settings'];
-    if (!isAdmin && adminOnlyTabs.includes(currentTab)) {
-      setCurrentTab('billing');
+    if (!allowedTabIds.includes(currentTab)) {
+      setCurrentTab(allowedTabIds[0] || 'billing');
     }
     if (!isDeveloper && currentTab === 'developer') {
       setCurrentTab('billing');
     }
-  }, [isAdmin, isDeveloper, currentTab]);
+  }, [allowedTabIds, currentTab, isDeveloper]);
 
-  // Global keyboard shortcuts for navigation (Alt+1 through Alt+8)
+  // Global keyboard shortcuts for navigation (Alt+1 through Alt+9)
   useEffect(() => {
     const handleGlobalNavKeys = (e: KeyboardEvent) => {
-      // Support Alt + 1..8
+      // Support Alt + 1..9
       if (e.altKey && !e.ctrlKey && !e.metaKey) {
         if (e.key === '1') {
           e.preventDefault();
@@ -63,16 +74,19 @@ const MainLayout: React.FC = () => {
         } else if (e.key === '4') {
           e.preventDefault();
           setCurrentTab('movements');
-        } else if (isAdmin && e.key === '5') {
+        } else if (e.key === '5') {
           e.preventDefault();
-          setCurrentTab('dashboard');
-        } else if (isAdmin && e.key === '6') {
+          setCurrentTab('cash_control');
+        } else if (e.key === '6') {
+          e.preventDefault();
+          setCurrentTab('customers');
+        } else if (e.key === '7') {
           e.preventDefault();
           setCurrentTab('expenses');
-        } else if (isAdmin && e.key === '7') {
+        } else if (e.key === '8') {
           e.preventDefault();
           setCurrentTab('reports');
-        } else if (isAdmin && e.key === '8') {
+        } else if (isAdmin && e.key === '9') {
           e.preventDefault();
           setCurrentTab('settings');
         }
@@ -110,6 +124,9 @@ const MainLayout: React.FC = () => {
 
   return (
     <div className="h-[100dvh] max-h-[100dvh] w-full flex flex-col overflow-hidden bg-neutral-50 font-sans antialiased text-neutral-900">
+      {/* Wireless Update Floating Banner */}
+      <UpdateNotificationBanner />
+
       {/* Top Bar */}
       <Navbar
         currentTab={currentTab}
@@ -132,15 +149,17 @@ const MainLayout: React.FC = () => {
           {currentTab === 'inventory' && <InventoryManager />}
           {currentTab === 'movements' && <StockMovementsList />}
           {currentTab === 'sales' && <BillHistory />}
+          {currentTab === 'cash_control' && <CashControlView />}
+          {currentTab === 'customers' && (isAdmin || allowedTabIds.includes('customers')) && <CustomersView />}
 
-          {/* Admin Protected Views */}
-          {isAdmin && currentTab === 'dashboard' && (
+          {/* Configurable / Admin Protected Views */}
+          {currentTab === 'dashboard' && (isAdmin || allowedTabIds.includes('dashboard')) && (
             <AdminDashboard onNavigateTab={setCurrentTab} />
           )}
-          {isAdmin && currentTab === 'expenses' && <ExpenseManager />}
-          {isAdmin && currentTab === 'reports' && <ReportsView />}
+          {currentTab === 'expenses' && (isAdmin || allowedTabIds.includes('expenses')) && <ExpenseManager />}
+          {currentTab === 'reports' && (isAdmin || allowedTabIds.includes('reports')) && <ReportsView />}
+          {currentTab === 'audit' && (isAdmin || allowedTabIds.includes('audit')) && <AuditLogsView />}
           {isAdmin && currentTab === 'employees' && <EmployeeManager />}
-          {isAdmin && currentTab === 'audit' && <AuditLogsView />}
           {isAdmin && currentTab === 'settings' && <SettingsView />}
           {isDeveloper && currentTab === 'developer' && <DeveloperConsole />}
         </main>
@@ -170,72 +189,108 @@ const MainLayout: React.FC = () => {
             </div>
 
             <div className="grid grid-cols-2 gap-2 text-xs">
-              {isAdmin && (
-                <>
-                  <button
-                    onClick={() => {
-                      setCurrentTab('expenses');
-                      setShowMobileMore(false);
-                    }}
-                    className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
-                  >
-                    <Wallet className="w-4 h-4 text-neutral-600" />
-                    Expenses
-                  </button>
-                  <button
-                    onClick={() => {
-                      setCurrentTab('reports');
-                      setShowMobileMore(false);
-                    }}
-                    className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
-                  >
-                    <FileBarChart2 className="w-4 h-4 text-neutral-600" />
-                    Reports & P&L
-                  </button>
-                  <button
-                    onClick={() => {
-                      setCurrentTab('employees');
-                      setShowMobileMore(false);
-                    }}
-                    className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
-                  >
-                    <Users className="w-4 h-4 text-neutral-600" />
-                    Staff Accounts
-                  </button>
-                  <button
-                    onClick={() => {
-                      setCurrentTab('audit');
-                      setShowMobileMore(false);
-                    }}
-                    className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
-                  >
-                    <ScrollText className="w-4 h-4 text-neutral-600" />
-                    Audit Logs
-                  </button>
-                  <button
-                    onClick={() => {
-                      setCurrentTab('settings');
-                      setShowMobileMore(false);
-                    }}
-                    className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
-                  >
-                    <Settings className="w-4 h-4 text-neutral-600" />
-                    Settings
-                  </button>
+              {allowedTabIds.includes('cash_control') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('cash_control');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <Banknote className="w-4 h-4 text-emerald-600" />
+                  Cash Control
+                </button>
+              )}
 
-                  {isDeveloper && (
-                    <button
-                      onClick={() => {
-                        setCurrentTab('developer');
-                        setShowMobileMore(false);
-                      }}
-                      className="p-3 bg-amber-50 rounded border border-amber-200 text-left font-medium flex items-center gap-2 text-amber-900"
-                    >
-                      <Code className="w-4 h-4 text-amber-600" />
-                      Developer APIs
-                    </button>
-                  )}
-                </>
+              {allowedTabIds.includes('customers') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('customers');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <UserCheck className="w-4 h-4 text-neutral-600" />
+                  Customers & Loyalty
+                </button>
+              )}
+
+              {allowedTabIds.includes('expenses') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('expenses');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <Wallet className="w-4 h-4 text-neutral-600" />
+                  Expenses
+                </button>
+              )}
+
+              {allowedTabIds.includes('reports') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('reports');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <FileBarChart2 className="w-4 h-4 text-neutral-600" />
+                  Reports & P&L
+                </button>
+              )}
+
+              {isAdmin && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('employees');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <Users className="w-4 h-4 text-neutral-600" />
+                  Staff Accounts
+                </button>
+              )}
+
+              {allowedTabIds.includes('audit') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('audit');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <ScrollText className="w-4 h-4 text-neutral-600" />
+                  Audit Logs
+                </button>
+              )}
+
+              {isAdmin && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('settings');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <Settings className="w-4 h-4 text-neutral-600" />
+                  Settings
+                </button>
+              )}
+
+              {isDeveloper && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('developer');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-amber-50 rounded border border-amber-200 text-left font-medium flex items-center gap-2 text-amber-900"
+                >
+                  <Code className="w-4 h-4 text-amber-600" />
+                  Developer APIs
+                </button>
               )}
 
               <button

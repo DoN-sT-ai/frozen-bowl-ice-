@@ -89,7 +89,9 @@ export class EmployeeService {
       throw new Error(`Username "${rawUsername}" is already taken in the cloud database`);
     }
 
-    const saved = await SupabaseDb.createUser(newEmp);
+    const currentStore = (await LocalDb.getStore(storeId)) || (await LocalDb.getFirstStore());
+    const storeName = currentStore?.name || 'Frozen Bowl';
+    const saved = await SupabaseDb.createUser(newEmp, storeName);
     AuditService.log({
       storeId, userId: adminUserId, userName: adminUserName,
       action: 'USER_CREATED', entityType: 'USER', entityId: saved.id,
@@ -203,6 +205,36 @@ export class EmployeeService {
     });
 
     return { success: true, message: `Staff member "${user.name}" removed` };
+  }
+
+  static async getEmployeePermissions(storeId: string, employeeId: string): Promise<string[]> {
+    return LocalDb.getEmployeePermissions(employeeId, storeId);
+  }
+
+  static async updateEmployeePermissions(
+    storeId: string,
+    adminUserId: string,
+    adminUserName: string,
+    employeeId: string,
+    permissions: string[]
+  ): Promise<{ success: boolean; permissions: string[] }> {
+    if (!Array.isArray(permissions)) {
+      throw new Error('Permissions must be an array of tab names');
+    }
+
+    await LocalDb.setEmployeePermissions(employeeId, storeId, permissions);
+
+    AuditService.log({
+      storeId,
+      userId: adminUserId,
+      userName: adminUserName,
+      action: 'EMPLOYEE_PERMISSIONS_UPDATED',
+      entityType: 'USER',
+      entityId: employeeId,
+      afterData: { permissions },
+    });
+
+    return { success: true, permissions };
   }
 }
 

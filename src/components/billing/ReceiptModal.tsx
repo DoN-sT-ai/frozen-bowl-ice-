@@ -4,7 +4,8 @@ import { formatCurrency, formatDateTime, formatBillNumber } from '../../lib/util
 import { useAuth } from '../../context/AuthContext';
 import { api } from '../../lib/api';
 import { shareReceiptPDF, downloadReceiptPDF } from '../../lib/pdfReceipt';
-import { printReceipt } from '../../lib/printerService';
+import { printReceipt, getPrinterSettings } from '../../lib/printerService';
+import { sendWhatsAppMessage } from '../../lib/whatsappService';
 import { ThermalReceiptContent } from './ThermalReceiptContent';
 import {
   Printer,
@@ -40,8 +41,10 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
   // Document Type: Always default to 'BILL' (Retail/Cash Bill) - Never invoice by default
   const [docType, setDocType] = useState<'BILL' | 'INVOICE'>('BILL');
 
-  // Printer format: Default is 'free' (Auto-Fit: fills thermal roll on POS printers, fills full page on A4 / Print to PDF)
-  const [printFormat, setPrintFormat] = useState<'free' | '80mm' | '58mm' | 'a4'>('free');
+  // Printer format: Default is 80mm thermal roll, or saved setting
+  const [printFormat, setPrintFormat] = useState<'free' | '80mm' | '58mm' | 'a4'>(() => {
+    return getPrinterSettings().format || '80mm';
+  });
 
   const [qrCodeDataUrl, setQrCodeDataUrl] = useState<string>('');
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
@@ -69,12 +72,15 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
 
   const handlePrint = (targetFormat?: 'free' | '80mm' | '58mm' | 'a4' | React.MouseEvent) => {
     const fmt = typeof targetFormat === 'string' ? targetFormat : printFormat;
+    const settings = getPrinterSettings();
     printReceipt({
       sale,
       store,
       format: fmt,
       docType,
       qrCodeDataUrl,
+      silent: settings.directPrint,
+      deviceName: settings.deviceName,
     });
   };
 
@@ -133,7 +139,7 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
     }
   };
 
-  const handleSendWhatsApp = () => {
+  const handleSendWhatsApp = async () => {
     let cleanPhone = whatsAppPhone.replace(/\D/g, '');
     if (cleanPhone.length === 10) {
       cleanPhone = `91${cleanPhone}`;
@@ -157,12 +163,8 @@ export const ReceiptModal: React.FC<ReceiptModalProps> = ({
       `*View & Verify Digital Bill Online:*\n${publicVerificationUrl}\n\n` +
       `Thank you for your business! 🙏`;
 
-    const url = cleanPhone
-      ? `https://wa.me/${cleanPhone}?text=${encodeURIComponent(text)}`
-      : `https://wa.me/?text=${encodeURIComponent(text)}`;
-
-    window.open(url, '_blank', 'noopener,noreferrer');
-    showToast('Opening WhatsApp...');
+    showToast('Sending via WhatsApp (Desktop App or Web)...');
+    await sendWhatsAppMessage({ phone: cleanPhone, text });
   };
 
   const handleCopyLink = async () => {

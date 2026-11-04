@@ -3,6 +3,7 @@ import { LocalDb } from '../localDb.ts';
 import { AuditService } from './auditService.ts';
 import { SupabaseDb } from '../supabaseDb.ts';
 import { isSupabaseConfigured } from '../supabaseClient.ts';
+import { CashControlService } from './cashControlService.ts';
 import crypto from 'crypto';
 
 function round2(num: number): number {
@@ -52,6 +53,8 @@ export class BillingService {
     const gstType = payload.gstType || 'INTRA_STATE';
     const globalTaxMode = payload.taxMode;
 
+    const rawDb = (await import('../localDb.ts')).localDbManager.getRawDb();
+
     // 1. Check total requested quantities across all items per product
     const totalQtyMap = new Map<string, number>();
     for (const item of payload.items) {
@@ -61,7 +64,14 @@ export class BillingService {
     }
 
     for (const [productId, totalQty] of totalQtyMap.entries()) {
-      const product = db.products.find(p => p.id === productId && p.store_id === storeId);
+      let product = db.products.find(p => p.id === productId && p.store_id === storeId);
+      if (!product) {
+        const row = rawDb.prepare('SELECT * FROM products WHERE id = ?').get(productId) as any;
+        if (row) {
+          product = row;
+          db.products.push(row);
+        }
+      }
       if (!product) throw new Error(`Product not found with ID ${productId}`);
       if (!product.active) throw new Error(`Product "${product.name}" is deactivated and cannot be sold`);
       if (product.current_stock < totalQty) {
@@ -70,7 +80,6 @@ export class BillingService {
     }
 
     // 2. Validate line items, resolve modifiers and compute financials
-    const rawDb = (await import('../localDb.ts')).localDbManager.getRawDb();
     const verifiedProducts: Array<{
       product: typeof db.products[0];
       quantity: number;
@@ -409,6 +418,10 @@ export class BillingService {
       afterData: { billNumber: newSale.bill_number, total: newSale.total, paymentMethod: newSale.payment_method, itemCount: saleItems.length },
     });
 
+    if (newSale.payment_method === 'CASH') {
+      await CashControlService.recordSaleIfSessionOpen(storeId, { ...newSale, items: saleItems }, userId, userName);
+    }
+
     return { ...newSale, items: saleItems };
   }
 
@@ -476,6 +489,10 @@ export class BillingService {
       storeId, userId, userName, action: 'SALE_VOIDED', entityType: 'SALE', entityId: sale.id,
       afterData: { billNumber: sale.bill_number, voidReason: sale.void_reason, voidedAt: sale.voided_at },
     });
+
+    if (sale.payment_method === 'CASH') {
+      await CashControlService.recordVoidIfSessionOpen(storeId, sale, userId, userName, reason.trim());
+    }
 
     return sale;
   }

@@ -895,13 +895,76 @@ var init_localDb = __esm({
       CREATE INDEX IF NOT EXISTS idx_sales_bill_number ON sales(bill_number);
       CREATE INDEX IF NOT EXISTS idx_sales_verification_token ON sales(verification_token);
       CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales(created_at);
+      CREATE INDEX IF NOT EXISTS idx_sales_customer_phone ON sales(store_id, customer_phone);
       CREATE INDEX IF NOT EXISTS idx_stock_movements_product_id ON stock_movements(product_id);
       CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
       CREATE INDEX IF NOT EXISTS idx_categories_store_id ON categories(store_id);
       CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
       CREATE INDEX IF NOT EXISTS idx_sale_items_product_id ON sale_items(product_id);
       CREATE INDEX IF NOT EXISTS idx_expenses_store_date ON expenses(store_id, expense_date);
+
+      CREATE TABLE IF NOT EXISTS cash_drawer_sessions (
+        id TEXT PRIMARY KEY,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        opened_by TEXT,
+        opened_by_name TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        opening_amount REAL NOT NULL DEFAULT 0.00,
+        opening_denominations_json TEXT DEFAULT '{}',
+        opening_notes TEXT DEFAULT '',
+        closed_by TEXT,
+        closed_by_name TEXT,
+        closed_at TEXT,
+        closing_amount REAL,
+        closing_denominations_json TEXT DEFAULT '{}',
+        closing_notes TEXT DEFAULT '',
+        expected_amount REAL NOT NULL DEFAULT 0.00,
+        cash_sales_amount REAL NOT NULL DEFAULT 0.00,
+        cash_in_amount REAL NOT NULL DEFAULT 0.00,
+        cash_out_amount REAL NOT NULL DEFAULT 0.00,
+        difference REAL DEFAULT 0.00,
+        status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cash_drawer_transactions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES cash_drawer_sessions(id) ON DELETE CASCADE,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        type TEXT NOT NULL CHECK (type IN ('OPENING_FLOAT', 'CASH_IN', 'CASH_OUT', 'SALE', 'REFUND')),
+        amount REAL NOT NULL,
+        category TEXT DEFAULT '',
+        reason TEXT DEFAULT '',
+        reference_id TEXT DEFAULT '',
+        performed_by TEXT,
+        performed_by_name TEXT NOT NULL,
+        notes TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS employee_tab_permissions (
+        user_id TEXT PRIMARY KEY,
+        store_id TEXT NOT NULL,
+        permissions_json TEXT NOT NULL DEFAULT '["billing","inventory","sales","movements","cash_control"]',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS store_printer_settings (
+        store_id TEXT PRIMARY KEY REFERENCES stores(id) ON DELETE CASCADE,
+        settings_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cash_sessions_store_status ON cash_drawer_sessions(store_id, status);
+      CREATE INDEX IF NOT EXISTS idx_cash_sessions_opened_at ON cash_drawer_sessions(opened_at);
+      CREATE INDEX IF NOT EXISTS idx_cash_tx_session ON cash_drawer_transactions(session_id);
+      CREATE INDEX IF NOT EXISTS idx_cash_tx_store_created ON cash_drawer_transactions(store_id, created_at);
     `);
+        try {
+          this.db.exec("ALTER TABLE users ADD COLUMN permissions_json TEXT DEFAULT ''");
+        } catch {
+        }
         try {
           this.db.exec("ALTER TABLE sale_items ADD COLUMN modifiers_json TEXT DEFAULT '[]'");
         } catch {
@@ -1015,9 +1078,15 @@ var init_localDb = __esm({
           const insertDefaultConfig = this.db.prepare(
             "INSERT OR IGNORE INTO developer_configs (key, value, updated_at) VALUES (?, ?, ?)"
           );
-          insertDefaultConfig.run("SUPABASE_URL", "https://sxzaalvmkkdnczrtzitd.supabase.co", now);
-          insertDefaultConfig.run("SUPABASE_ANON_KEY", "sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM", now);
-          insertDefaultConfig.run("SUPABASE_SERVICE_ROLE_KEY", "sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM", now);
+          if (process.env.SUPABASE_URL) {
+            insertDefaultConfig.run("SUPABASE_URL", process.env.SUPABASE_URL.trim(), now);
+          }
+          if (process.env.SUPABASE_ANON_KEY) {
+            insertDefaultConfig.run("SUPABASE_ANON_KEY", process.env.SUPABASE_ANON_KEY.trim(), now);
+          }
+          if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+            insertDefaultConfig.run("SUPABASE_SERVICE_ROLE_KEY", process.env.SUPABASE_SERVICE_ROLE_KEY.trim(), now);
+          }
         } catch (_) {
         }
       }
@@ -1164,6 +1233,98 @@ var init_localDb = __esm({
           storeId
         );
         return updated;
+      }
+      static async getPrinterSettings(storeId) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        try {
+          const row = this.db.prepare("SELECT settings_json FROM store_printer_settings WHERE store_id = ?").get(validStoreId);
+          if (!row || !row.settings_json) return null;
+          return JSON.parse(row.settings_json);
+        } catch {
+          return null;
+        }
+      }
+      static async savePrinterSettings(storeId, settings) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const settingsJson = JSON.stringify(settings);
+        this.db.prepare(`
+      INSERT INTO store_printer_settings (store_id, settings_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(store_id) DO UPDATE SET
+        settings_json = excluded.settings_json,
+        updated_at = excluded.updated_at
+    `).run(validStoreId, settingsJson, now);
+        return settings;
+      }
+      static async syncStoreFromCloud(storeData) {
+        const rawDb = this.getRawDb();
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        let existing = null;
+        if (storeData.id) {
+          existing = await this.getStore(storeData.id);
+        }
+        if (!existing && storeData.code) {
+          const row = rawDb.prepare("SELECT * FROM stores WHERE LOWER(code) = LOWER(?)").get(storeData.code);
+          if (row) existing = row;
+        }
+        if (!existing && storeData.name) {
+          const row = rawDb.prepare("SELECT * FROM stores WHERE LOWER(name) = LOWER(?)").get(storeData.name);
+          if (row) existing = row;
+        }
+        if (existing) {
+          rawDb.prepare(`
+        UPDATE stores
+        SET name = ?,
+            code = COALESCE(?, code),
+            address = COALESCE(?, address),
+            phone = COALESCE(?, phone),
+            email = COALESCE(?, email),
+            gstin = COALESCE(?, gstin),
+            currency = COALESCE(?, currency),
+            invoice_prefix = COALESCE(?, invoice_prefix),
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+            storeData.name,
+            storeData.code || null,
+            storeData.address || null,
+            storeData.phone || null,
+            storeData.email || null,
+            storeData.gstin || null,
+            storeData.currency || null,
+            storeData.invoice_prefix || null,
+            now,
+            existing.id
+          );
+          return await this.getStore(existing.id);
+        } else {
+          const targetId = storeData.id || crypto2.randomUUID();
+          const code = storeData.code || storeData.name.toUpperCase().replace(/[^A-Z0-9]/g, "-").slice(0, 10);
+          rawDb.prepare(`
+        INSERT INTO stores (id, name, code, address, phone, email, gstin, currency, timezone, invoice_prefix, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+            targetId,
+            storeData.name,
+            code,
+            storeData.address || "",
+            storeData.phone || "",
+            storeData.email || "",
+            storeData.gstin || "",
+            storeData.currency || "INR",
+            "Asia/Kolkata",
+            storeData.invoice_prefix || "INV-",
+            now,
+            now
+          );
+          this.seedDefaultCategories(targetId, [
+            { name: "Specialties", description: "House specialty recipes" },
+            { name: "Beverages", description: "Drinks & beverages" },
+            { name: "Desserts", description: "Desserts & frozen items" }
+          ]);
+          return await this.getStore(targetId);
+        }
       }
       // USERS
       static async getUsers(storeId) {
@@ -1632,6 +1793,249 @@ var init_localDb = __esm({
           }))
         };
       }
+      static async getSaleById(id) {
+        const saleRow = this.db.prepare("SELECT * FROM sales WHERE id = ?").get(id.trim());
+        if (!saleRow) return null;
+        const itemsRows = this.db.prepare("SELECT * FROM sale_items WHERE sale_id = ? ORDER BY created_at ASC").all(saleRow.id);
+        return {
+          ...saleRow,
+          subtotal: Number(saleRow.subtotal) || 0,
+          discount: Number(saleRow.discount) || 0,
+          tax: Number(saleRow.tax) || 0,
+          cgst: saleRow.cgst != null ? Number(saleRow.cgst) : void 0,
+          sgst: saleRow.sgst != null ? Number(saleRow.sgst) : void 0,
+          igst: saleRow.igst != null ? Number(saleRow.igst) : void 0,
+          round_off: saleRow.round_off != null ? Number(saleRow.round_off) : void 0,
+          total: Number(saleRow.total) || 0,
+          items: itemsRows.map((item) => ({
+            ...item,
+            quantity: Number(item.quantity) || 0,
+            unit_price: Number(item.unit_price) || 0,
+            purchase_price_snapshot: Number(item.purchase_price_snapshot) || 0,
+            tax_rate: Number(item.tax_rate) || 0,
+            tax_amount: Number(item.tax_amount) || 0,
+            taxable_value: item.taxable_value != null ? Number(item.taxable_value) : void 0,
+            cgst_amount: item.cgst_amount != null ? Number(item.cgst_amount) : void 0,
+            sgst_amount: item.sgst_amount != null ? Number(item.sgst_amount) : void 0,
+            igst_amount: item.igst_amount != null ? Number(item.igst_amount) : void 0,
+            discount: Number(item.discount) || 0,
+            line_total: Number(item.line_total) || 0,
+            selected_modifiers: item.modifiers_json ? (() => {
+              try {
+                return JSON.parse(item.modifiers_json);
+              } catch {
+                return void 0;
+              }
+            })() : void 0
+          }))
+        };
+      }
+      static async getCustomerByPhone(storeId, phone) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const row = this.db.prepare(`
+      SELECT customer_name, customer_phone, customer_gstin
+      FROM sales
+      WHERE store_id = ? AND customer_phone = ? AND customer_name IS NOT NULL AND TRIM(customer_name) != ''
+      ORDER BY created_at DESC LIMIT 1
+    `).get(validStoreId, phone.trim());
+        if (!row) return null;
+        return {
+          customer_name: row.customer_name,
+          customer_phone: row.customer_phone,
+          customer_gstin: row.customer_gstin || void 0
+        };
+      }
+      static async searchCustomers(storeId, query, limit = 8) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const cleanQ = (query || "").trim();
+        if (!cleanQ) return [];
+        const pattern = `%${cleanQ}%`;
+        const rows = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as visit_count,
+        ROUND(SUM(total), 2) as total_spend,
+        MAX(created_at) as last_visit
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+        AND (customer_phone LIKE ? OR customer_name LIKE ?)
+      GROUP BY customer_phone
+      ORDER BY 
+        CASE WHEN customer_phone LIKE ? THEN 0 ELSE 1 END,
+        visit_count DESC,
+        last_visit DESC
+      LIMIT ?
+    `).all(validStoreId, pattern, pattern, `${cleanQ}%`, limit);
+        return rows.map((r) => ({
+          customer_name: r.customer_name,
+          customer_phone: r.customer_phone,
+          customer_gstin: r.customer_gstin || void 0,
+          visit_count: Number(r.visit_count) || 1,
+          total_spend: Number(r.total_spend) || 0,
+          last_visit: r.last_visit
+        }));
+      }
+      static async getCustomerAnalytics(storeId) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const customerRows = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as total_visits,
+        ROUND(SUM(total), 2) as total_spend,
+        ROUND(AVG(total), 2) as avg_bill_value,
+        MIN(created_at) as first_visit,
+        MAX(created_at) as last_visit
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+      GROUP BY customer_phone
+      ORDER BY total_visits DESC, total_spend DESC
+    `).all(validStoreId);
+        const favoriteItemsRows = this.db.prepare(`
+      SELECT 
+        s.customer_phone,
+        si.product_name_snapshot,
+        SUM(si.quantity) as total_qty
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      WHERE s.store_id = ? AND s.customer_phone IS NOT NULL AND TRIM(s.customer_phone) != ''
+      GROUP BY s.customer_phone, si.product_name_snapshot
+      ORDER BY s.customer_phone, total_qty DESC
+    `).all(validStoreId);
+        const customerFavMap = /* @__PURE__ */ new Map();
+        for (const row of favoriteItemsRows) {
+          const list = customerFavMap.get(row.customer_phone) || [];
+          if (list.length < 3 && row.product_name_snapshot) {
+            list.push(row.product_name_snapshot);
+            customerFavMap.set(row.customer_phone, list);
+          }
+        }
+        const customers = customerRows.map((c) => {
+          const visits = Number(c.total_visits) || 1;
+          let tier = "NEW";
+          if (visits >= 5) tier = "VIP";
+          else if (visits >= 2) tier = "REGULAR";
+          return {
+            customer_name: c.customer_name,
+            customer_phone: c.customer_phone,
+            customer_gstin: c.customer_gstin || void 0,
+            total_visits: visits,
+            total_spend: Number(c.total_spend) || 0,
+            avg_bill_value: Number(c.avg_bill_value) || 0,
+            first_visit: c.first_visit,
+            last_visit: c.last_visit,
+            tier,
+            favorite_items: customerFavMap.get(c.customer_phone) || []
+          };
+        });
+        const totalUnique = customers.length;
+        const repeatCount = customers.filter((c) => c.total_visits > 1).length;
+        const repeatRate = totalUnique > 0 ? Math.round(repeatCount / totalUnique * 1e3) / 10 : 0;
+        const totalSpend = customers.reduce((acc, c) => acc + c.total_spend, 0);
+        const avgSpendPerCustomer = totalUnique > 0 ? Math.round(totalSpend / totalUnique * 100) / 100 : 0;
+        const weekStats = this.db.prepare(`
+      SELECT 
+        COUNT(CASE WHEN created_at >= date('now', '-7 days') THEN 1 END) as this_week,
+        COUNT(CASE WHEN created_at >= date('now', '-14 days') AND created_at < date('now', '-7 days') THEN 1 END) as last_week,
+        COUNT(CASE WHEN created_at >= date('now', '-7 days') AND customer_phone IN (
+          SELECT customer_phone FROM sales WHERE store_id = ? GROUP BY customer_phone HAVING MIN(created_at) >= date('now', '-7 days')
+        ) THEN 1 END) as new_this_week
+      FROM sales
+      WHERE store_id = ? AND customer_phone IS NOT NULL AND TRIM(customer_phone) != ''
+    `).get(validStoreId, validStoreId);
+        const dailyRows = this.db.prepare(`
+      SELECT 
+        strftime('%Y-%m-%d', created_at) as day_date,
+        COUNT(*) as visit_count,
+        ROUND(SUM(total), 2) as revenue
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+        AND created_at >= date('now', '-7 days')
+      GROUP BY strftime('%Y-%m-%d', created_at)
+      ORDER BY day_date ASC
+    `).all(validStoreId);
+        const dailyMap = /* @__PURE__ */ new Map();
+        for (const r of dailyRows) {
+          dailyMap.set(r.day_date, {
+            visit_count: Number(r.visit_count) || 0,
+            revenue: Number(r.revenue) || 0
+          });
+        }
+        const daysMap = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+        const weeklyTrends = [];
+        const now = /* @__PURE__ */ new Date();
+        for (let i = 6; i >= 0; i--) {
+          const d = new Date(now);
+          d.setDate(d.getDate() - i);
+          const isoDate = d.toISOString().slice(0, 10);
+          const stats = dailyMap.get(isoDate) || { visit_count: 0, revenue: 0 };
+          weeklyTrends.push({
+            date: isoDate,
+            day_name: daysMap[d.getDay()],
+            visit_count: stats.visit_count,
+            revenue: stats.revenue
+          });
+        }
+        return {
+          summary: {
+            total_unique_customers: totalUnique,
+            repeat_customers: repeatCount,
+            repeat_rate: repeatRate,
+            total_spend: totalSpend,
+            avg_spend_per_customer: avgSpendPerCustomer,
+            visits_this_week: Number(weekStats?.this_week) || 0,
+            visits_last_week: Number(weekStats?.last_week) || 0,
+            new_customers_this_week: Number(weekStats?.new_this_week) || 0
+          },
+          customers,
+          weekly_trends: weeklyTrends
+        };
+      }
+      static async getCustomerHistory(storeId, phone) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const cleanPhone = (phone || "").trim();
+        if (!cleanPhone) return { customer: null, sales: [] };
+        const saleRows = this.db.prepare(`
+      SELECT id FROM sales
+      WHERE store_id = ? AND customer_phone = ?
+      ORDER BY created_at DESC
+    `).all(validStoreId, cleanPhone);
+        const sales = [];
+        for (const r of saleRows) {
+          const s = await this.getSaleById(r.id);
+          if (s) sales.push(s);
+        }
+        const customerSummary = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as total_visits,
+        ROUND(SUM(total), 2) as total_spend
+      FROM sales
+      WHERE store_id = ? AND customer_phone = ?
+      GROUP BY customer_phone
+    `).get(validStoreId, cleanPhone);
+        return {
+          customer: customerSummary ? {
+            customer_name: customerSummary.customer_name,
+            customer_phone: customerSummary.customer_phone,
+            customer_gstin: customerSummary.customer_gstin || void 0,
+            total_visits: Number(customerSummary.total_visits) || 0,
+            total_spend: Number(customerSummary.total_spend) || 0
+          } : null,
+          sales
+        };
+      }
       static async createSale(sale, items) {
         const saleId = ensureUuid(sale.id);
         const storeId = this.resolveValidStoreId(sale.store_id);
@@ -1853,6 +2257,252 @@ var init_localDb = __esm({
         const nextVal = seqRow?.last_number || 1;
         const formattedNum = String(nextVal).padStart(6, "0");
         return `${billPrefix}${formattedNum}`;
+      }
+      // ==========================================
+      // CASH DRAWER CONTROL & SESSIONS
+      // ==========================================
+      static async getActiveCashDrawerSession(storeId) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ? AND status = 'OPEN'
+      ORDER BY opened_at DESC LIMIT 1
+    `).get(validStoreId);
+        if (!row) return null;
+        return {
+          ...row,
+          opening_amount: Number(row.opening_amount) || 0,
+          closing_amount: row.closing_amount !== null && row.closing_amount !== void 0 ? Number(row.closing_amount) : void 0,
+          expected_amount: Number(row.expected_amount) || 0,
+          cash_sales_amount: Number(row.cash_sales_amount) || 0,
+          cash_in_amount: Number(row.cash_in_amount) || 0,
+          cash_out_amount: Number(row.cash_out_amount) || 0,
+          difference: row.difference !== null && row.difference !== void 0 ? Number(row.difference) : void 0
+        };
+      }
+      static async getLastClosedCashDrawerSession(storeId) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ? AND status = 'CLOSED'
+      ORDER BY closed_at DESC, opened_at DESC LIMIT 1
+    `).get(validStoreId);
+        if (!row) return null;
+        return {
+          ...row,
+          opening_amount: Number(row.opening_amount) || 0,
+          closing_amount: row.closing_amount !== null && row.closing_amount !== void 0 ? Number(row.closing_amount) : 0,
+          expected_amount: Number(row.expected_amount) || 0,
+          cash_sales_amount: Number(row.cash_sales_amount) || 0,
+          cash_in_amount: Number(row.cash_in_amount) || 0,
+          cash_out_amount: Number(row.cash_out_amount) || 0,
+          difference: row.difference !== null && row.difference !== void 0 ? Number(row.difference) : 0
+        };
+      }
+      static async getCashDrawerSession(sessionId) {
+        const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions WHERE id = ?
+    `).get(sessionId);
+        if (!row) return null;
+        return {
+          ...row,
+          opening_amount: Number(row.opening_amount) || 0,
+          closing_amount: row.closing_amount !== null && row.closing_amount !== void 0 ? Number(row.closing_amount) : void 0,
+          expected_amount: Number(row.expected_amount) || 0,
+          cash_sales_amount: Number(row.cash_sales_amount) || 0,
+          cash_in_amount: Number(row.cash_in_amount) || 0,
+          cash_out_amount: Number(row.cash_out_amount) || 0,
+          difference: row.difference !== null && row.difference !== void 0 ? Number(row.difference) : void 0
+        };
+      }
+      static async createCashDrawerSession(session) {
+        const id = ensureUuid(session.id);
+        const storeId = this.resolveValidStoreId(session.store_id);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const openedBy = nullableUuid(session.opened_by);
+        this.db.prepare(`
+      INSERT INTO cash_drawer_sessions (
+        id, store_id, opened_by, opened_by_name, opened_at,
+        opening_amount, opening_denominations_json, opening_notes,
+        closed_by, closed_by_name, closed_at,
+        closing_amount, closing_denominations_json, closing_notes,
+        expected_amount, cash_sales_amount, cash_in_amount, cash_out_amount,
+        difference, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+          id,
+          storeId,
+          openedBy,
+          session.opened_by_name || "Cashier",
+          session.opened_at || now,
+          Number(session.opening_amount) || 0,
+          session.opening_denominations_json || "{}",
+          session.opening_notes || "",
+          session.closed_by || null,
+          session.closed_by_name || null,
+          session.closed_at || null,
+          session.closing_amount !== void 0 ? Number(session.closing_amount) : null,
+          session.closing_denominations_json || "{}",
+          session.closing_notes || "",
+          Number(session.expected_amount) || Number(session.opening_amount) || 0,
+          Number(session.cash_sales_amount) || 0,
+          Number(session.cash_in_amount) || 0,
+          Number(session.cash_out_amount) || 0,
+          session.difference !== void 0 ? Number(session.difference) : 0,
+          session.status || "OPEN",
+          now,
+          now
+        );
+        return await this.getCashDrawerSession(id);
+      }
+      static async updateCashDrawerSession(sessionId, updates) {
+        const existing = await this.getCashDrawerSession(sessionId);
+        if (!existing) throw new Error("Cash drawer session not found");
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const fields = ["updated_at = ?"];
+        const values = [now];
+        if (updates.closed_by !== void 0) {
+          fields.push("closed_by = ?");
+          values.push(nullableUuid(updates.closed_by));
+        }
+        if (updates.closed_by_name !== void 0) {
+          fields.push("closed_by_name = ?");
+          values.push(updates.closed_by_name);
+        }
+        if (updates.closed_at !== void 0) {
+          fields.push("closed_at = ?");
+          values.push(updates.closed_at);
+        }
+        if (updates.closing_amount !== void 0) {
+          fields.push("closing_amount = ?");
+          values.push(Number(updates.closing_amount));
+        }
+        if (updates.closing_denominations_json !== void 0) {
+          fields.push("closing_denominations_json = ?");
+          values.push(updates.closing_denominations_json);
+        }
+        if (updates.closing_notes !== void 0) {
+          fields.push("closing_notes = ?");
+          values.push(updates.closing_notes);
+        }
+        if (updates.expected_amount !== void 0) {
+          fields.push("expected_amount = ?");
+          values.push(Number(updates.expected_amount));
+        }
+        if (updates.cash_sales_amount !== void 0) {
+          fields.push("cash_sales_amount = ?");
+          values.push(Number(updates.cash_sales_amount));
+        }
+        if (updates.cash_in_amount !== void 0) {
+          fields.push("cash_in_amount = ?");
+          values.push(Number(updates.cash_in_amount));
+        }
+        if (updates.cash_out_amount !== void 0) {
+          fields.push("cash_out_amount = ?");
+          values.push(Number(updates.cash_out_amount));
+        }
+        if (updates.difference !== void 0) {
+          fields.push("difference = ?");
+          values.push(Number(updates.difference));
+        }
+        if (updates.status !== void 0) {
+          fields.push("status = ?");
+          values.push(updates.status);
+        }
+        values.push(sessionId);
+        this.db.prepare(`UPDATE cash_drawer_sessions SET ${fields.join(", ")} WHERE id = ?`).run(...values);
+        return await this.getCashDrawerSession(sessionId);
+      }
+      static async listCashDrawerSessions(storeId, limit = 50) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const rows = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ?
+      ORDER BY opened_at DESC
+      LIMIT ?
+    `).all(validStoreId, limit);
+        return rows.map((r) => ({
+          ...r,
+          opening_amount: Number(r.opening_amount) || 0,
+          closing_amount: r.closing_amount !== null && r.closing_amount !== void 0 ? Number(r.closing_amount) : void 0,
+          expected_amount: Number(r.expected_amount) || 0,
+          cash_sales_amount: Number(r.cash_sales_amount) || 0,
+          cash_in_amount: Number(r.cash_in_amount) || 0,
+          cash_out_amount: Number(r.cash_out_amount) || 0,
+          difference: r.difference !== null && r.difference !== void 0 ? Number(r.difference) : void 0
+        }));
+      }
+      static async createCashDrawerTransaction(tx) {
+        const id = ensureUuid(tx.id);
+        const storeId = this.resolveValidStoreId(tx.store_id);
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const performedBy = nullableUuid(tx.performed_by);
+        this.db.prepare(`
+      INSERT INTO cash_drawer_transactions (
+        id, session_id, store_id, type, amount, category, reason, reference_id, performed_by, performed_by_name, notes, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+          id,
+          tx.session_id,
+          storeId,
+          tx.type,
+          Number(tx.amount) || 0,
+          tx.category || "",
+          tx.reason || "",
+          tx.reference_id || "",
+          performedBy,
+          tx.performed_by_name || "Staff",
+          tx.notes || "",
+          now
+        );
+        return {
+          ...tx,
+          id,
+          store_id: storeId,
+          performed_by: performedBy || void 0,
+          created_at: now
+        };
+      }
+      static async getCashDrawerTransactions(sessionId) {
+        const rows = this.db.prepare(`
+      SELECT * FROM cash_drawer_transactions
+      WHERE session_id = ?
+      ORDER BY created_at ASC
+    `).all(sessionId);
+        return rows.map((r) => ({
+          ...r,
+          amount: Number(r.amount) || 0
+        }));
+      }
+      // ==========================================
+      // EMPLOYEE TAB PERMISSIONS
+      // ==========================================
+      static async getEmployeePermissions(userId, storeId) {
+        try {
+          const row = this.db.prepare("SELECT permissions_json FROM employee_tab_permissions WHERE user_id = ?").get(userId);
+          if (row?.permissions_json) {
+            return JSON.parse(row.permissions_json);
+          }
+          const userRow = this.db.prepare("SELECT permissions_json FROM users WHERE id = ?").get(userId);
+          if (userRow?.permissions_json) {
+            return JSON.parse(userRow.permissions_json);
+          }
+        } catch (_) {
+        }
+        return ["billing", "inventory", "sales", "movements", "cash_control"];
+      }
+      static async setEmployeePermissions(userId, storeId, permissions) {
+        const now = (/* @__PURE__ */ new Date()).toISOString();
+        const json = JSON.stringify(permissions);
+        this.db.prepare(`
+      INSERT INTO employee_tab_permissions (user_id, store_id, permissions_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET permissions_json = excluded.permissions_json, updated_at = excluded.updated_at
+    `).run(userId, storeId, json, now);
+        try {
+          this.db.prepare("UPDATE users SET permissions_json = ? WHERE id = ?").run(json, userId);
+        } catch (_) {
+        }
       }
       // EXPORT BACKUP
       static exportBackup(storeId) {
@@ -2416,8 +3066,8 @@ for (const envFile of envCandidates) {
     break;
   }
 }
-var DEFAULT_SUPABASE_URL = "https://sxzaalvmkkdnczrtzitd.supabase.co";
-var DEFAULT_SUPABASE_KEY = "sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM";
+var DEFAULT_SUPABASE_URL = (process.env.SUPABASE_URL || "").trim();
+var DEFAULT_SUPABASE_KEY = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "").trim();
 function getResolvedSupabaseConfig() {
   let url = (process.env.SUPABASE_URL || "").trim();
   let key = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY || "").trim();
@@ -2443,9 +3093,11 @@ function getResolvedSupabaseConfig() {
   if (!key || key.includes("your-supabase")) {
     key = DEFAULT_SUPABASE_KEY;
   }
-  process.env.SUPABASE_URL = url;
-  process.env.SUPABASE_ANON_KEY = key;
-  process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+  if (url) process.env.SUPABASE_URL = url;
+  if (key) {
+    process.env.SUPABASE_ANON_KEY = key;
+    process.env.SUPABASE_SERVICE_ROLE_KEY = key;
+  }
   return { url, key };
 }
 var { url: initialUrl, key: initialKey } = getResolvedSupabaseConfig();
@@ -2478,7 +3130,15 @@ var SupabaseDb = class {
     const clean = emailOrUsername.trim().toLowerCase();
     let queryResult;
     try {
-      queryResult = await client.from("users").select("*").or(`email.ilike.${clean},name.ilike.${clean}`).maybeSingle();
+      const isEmail = clean.includes("@");
+      if (isEmail) {
+        queryResult = await client.from("users").select("*").ilike("email", clean).maybeSingle();
+      } else {
+        queryResult = await client.from("users").select("*").ilike("name", clean).maybeSingle();
+        if (!queryResult.data) {
+          queryResult = await client.from("users").select("*").ilike("email", clean).maybeSingle();
+        }
+      }
     } catch (networkErr) {
       console.warn("[Supabase] Offline network error:", networkErr?.message || networkErr);
       throw new Error("No internet connection. Please connect to the internet to log in to your store account, or use Developer offline mode.");
@@ -2488,17 +3148,22 @@ var SupabaseDb = class {
       throw new Error(`Supabase User Query Error: ${error.message}`);
     }
     if (!data) return null;
-    const isBlocked = data.is_blocked === true || data.active === false || data.status === "BLOCKED" || data.status === "INACTIVE";
+    const isUserBlocked = data.is_blocked === true || data.active === false || String(data.status || "").toUpperCase() === "BLOCKED" || String(data.status || "").toUpperCase() === "INACTIVE" || String(data.status || "").toUpperCase() === "SUSPENDED";
+    const isStoreStoppedOnUser = data.store_active === false || data.is_store_active === false || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED", "EXPIRED"].includes(String(data.store_status || "").toUpperCase()) || String(data.plan_status || "").toUpperCase() === "EXPIRED";
     return {
       id: data.id,
       store_id: data.store_id || "a0000000-0000-0000-0000-000000000001",
+      store_name: data.store_name || null,
+      store_status: data.store_status || null,
+      store_active: data.store_active !== false,
       name: data.name || data.email,
       email: data.email,
       password_hash: data.password_hash || data.password || "",
       salt: data.salt || "",
       role: ["ADMIN", "DEVELOPER"].includes(data.role?.toUpperCase()) ? data.role.toUpperCase() : "EMPLOYEE",
-      active: !isBlocked,
-      is_blocked: isBlocked,
+      active: !isUserBlocked && !isStoreStoppedOnUser,
+      is_blocked: isUserBlocked,
+      is_store_stopped: isStoreStoppedOnUser,
       status: data.status,
       last_login_at: data.last_login_at,
       created_at: data.created_at || (/* @__PURE__ */ new Date()).toISOString(),
@@ -2509,16 +3174,23 @@ var SupabaseDb = class {
     const client = this.checkSupabase();
     const { data, error } = await client.from("users").select("*").eq("id", id).maybeSingle();
     if (error || !data) return null;
-    const isBlocked = data.is_blocked === true || data.active === false || data.status === "BLOCKED" || data.status === "INACTIVE";
+    const isUserBlocked = data.is_blocked === true || data.active === false || String(data.status || "").toUpperCase() === "BLOCKED" || String(data.status || "").toUpperCase() === "INACTIVE" || String(data.status || "").toUpperCase() === "SUSPENDED";
+    const isStoreStoppedOnUser = data.store_active === false || data.is_store_active === false || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED", "EXPIRED"].includes(String(data.store_status || "").toUpperCase()) || String(data.plan_status || "").toUpperCase() === "EXPIRED";
     return {
       id: data.id,
       store_id: data.store_id || "a0000000-0000-0000-0000-000000000001",
+      store_name: data.store_name || null,
+      store_status: data.store_status || null,
+      store_active: data.store_active !== false,
       name: data.name || data.email,
       email: data.email,
       password_hash: data.password_hash || data.password || "",
       salt: data.salt || "",
       role: ["ADMIN", "DEVELOPER"].includes(data.role?.toUpperCase()) ? data.role.toUpperCase() : "EMPLOYEE",
-      active: !isBlocked,
+      active: !isUserBlocked && !isStoreStoppedOnUser,
+      is_blocked: isUserBlocked,
+      is_store_stopped: isStoreStoppedOnUser,
+      status: data.status,
       last_login_at: data.last_login_at,
       created_at: data.created_at || (/* @__PURE__ */ new Date()).toISOString(),
       updated_at: data.updated_at || data.created_at || (/* @__PURE__ */ new Date()).toISOString()
@@ -2544,7 +3216,7 @@ var SupabaseDb = class {
       updated_at: u.updated_at
     }));
   }
-  static async createUser(user) {
+  static async createUser(user, storeName) {
     const client = this.checkSupabase();
     const insertPayload = {
       id: user.id,
@@ -2560,10 +3232,18 @@ var SupabaseDb = class {
       created_at: user.created_at,
       updated_at: user.updated_at
     };
-    const { data, error } = await client.from("users").insert(insertPayload).select().single();
-    if (error) {
-      throw new Error(`Failed to create employee in Supabase: ${error.message}`);
+    if (storeName) {
+      insertPayload.store_name = storeName;
     }
+    let insertRes = await client.from("users").insert(insertPayload).select().single();
+    if (insertRes.error && insertPayload.store_name && (insertRes.error.code === "PGRST204" || insertRes.error.message?.includes("store_name"))) {
+      delete insertPayload.store_name;
+      insertRes = await client.from("users").insert(insertPayload).select().single();
+    }
+    if (insertRes.error) {
+      throw new Error(`Failed to create employee in Supabase: ${insertRes.error.message}`);
+    }
+    const data = insertRes.data;
     return {
       id: data.id,
       store_id: data.store_id,
@@ -2591,6 +3271,185 @@ var SupabaseDb = class {
     if (error) {
       throw new Error(`Failed to delete user in Supabase: ${error.message}`);
     }
+  }
+  // ============================================================
+  // MULTI-STORE MANAGEMENT & REMOTE STOP (SUPABASE CLOUD)
+  // Each shop (e.g. "Frozen Bowl", "2ice") is tracked in Supabase.
+  // Stopping a store immediately blocks all associated users.
+  // ============================================================
+  static async getStoreFromCloud(storeIdOrName) {
+    if (!isSupabaseConfigured || !supabase) return null;
+    const client = supabase;
+    const trimmed = (storeIdOrName || "").trim();
+    if (!trimmed) return null;
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(trimmed);
+      let data = null;
+      let error = null;
+      if (isUuid) {
+        const res = await client.from("stores").select("*").eq("id", trimmed).maybeSingle();
+        data = res.data;
+        error = res.error;
+      }
+      if (!data) {
+        const resName = await client.from("stores").select("*").ilike("name", trimmed).maybeSingle();
+        if (resName.data) {
+          data = resName.data;
+          error = null;
+        } else if (!error) {
+          error = resName.error;
+        }
+      }
+      if (!data) {
+        const resCode = await client.from("stores").select("*").ilike("code", trimmed).maybeSingle();
+        if (resCode.data) {
+          data = resCode.data;
+          error = null;
+        }
+      }
+      if (error) {
+        if (error.code === "PGRST205" || error.message?.includes("schema cache")) {
+          return null;
+        }
+        console.warn("[Supabase] Notice querying stores table:", error.message);
+        return null;
+      }
+      if (!data) return null;
+      const isStopped = data.active === false || data.is_active === false || data.is_blocked === true || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED", "CLOSED", "DISABLED"].includes(String(data.status || "").toUpperCase()) || String(data.plan_status || "").toUpperCase() === "EXPIRED" || data.plan_expires_at && new Date(data.plan_expires_at).getTime() < Date.now();
+      return {
+        id: data.id,
+        name: data.name || trimmed,
+        code: data.code || "STORE-01",
+        active: !isStopped,
+        status: data.status || (isStopped ? "STOPPED" : "ACTIVE"),
+        is_blocked: Boolean(data.is_blocked),
+        plan_status: data.plan_status || (isStopped ? "EXPIRED" : "ACTIVE"),
+        plan_expires_at: data.plan_expires_at,
+        address: data.address || "",
+        phone: data.phone || "",
+        email: data.email || "",
+        gstin: data.gstin || "",
+        currency: data.currency || "INR",
+        timezone: data.timezone || "Asia/Kolkata",
+        invoice_prefix: data.invoice_prefix || "INV-",
+        is_stopped: isStopped,
+        created_at: data.created_at,
+        updated_at: data.updated_at
+      };
+    } catch (err) {
+      console.warn("[Supabase] Exception checking store in cloud:", err?.message || err);
+      return null;
+    }
+  }
+  static async listStoresFromCloud() {
+    if (!isSupabaseConfigured || !supabase) return [];
+    const client = supabase;
+    try {
+      const { data, error } = await client.from("stores").select("*").order("name", { ascending: true });
+      if (!error && Array.isArray(data) && data.length > 0) {
+        return data.map((s) => {
+          const isStopped = s.active === false || s.is_active === false || s.is_blocked === true || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED", "CLOSED", "DISABLED"].includes(String(s.status || "").toUpperCase()) || String(s.plan_status || "").toUpperCase() === "EXPIRED";
+          return {
+            id: s.id,
+            name: s.name,
+            code: s.code || "STORE-01",
+            active: !isStopped,
+            status: s.status || (isStopped ? "STOPPED" : "ACTIVE"),
+            is_blocked: Boolean(s.is_blocked),
+            plan_status: s.plan_status || (isStopped ? "EXPIRED" : "ACTIVE"),
+            plan_expires_at: s.plan_expires_at,
+            address: s.address || "",
+            phone: s.phone || "",
+            email: s.email || "",
+            gstin: s.gstin || "",
+            currency: s.currency || "INR",
+            timezone: s.timezone || "Asia/Kolkata",
+            invoice_prefix: s.invoice_prefix || "INV-",
+            is_stopped: isStopped,
+            created_at: s.created_at,
+            updated_at: s.updated_at
+          };
+        });
+      }
+    } catch (_) {
+    }
+    try {
+      const { data: users, error: uErr } = await client.from("users").select("store_id, store_name, status, is_blocked, active, store_status, store_active");
+      if (!uErr && Array.isArray(users)) {
+        const storeMap = /* @__PURE__ */ new Map();
+        for (const u of users) {
+          const key = u.store_name || u.store_id || "Frozen Bowl";
+          if (!storeMap.has(key)) {
+            const isStopped = u.store_active === false || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED"].includes(String(u.store_status || "").toUpperCase());
+            storeMap.set(key, {
+              id: u.store_id || key,
+              name: u.store_name || (u.store_id === "STORE-01" ? "Frozen Bowl" : key),
+              code: (u.store_name || key).toUpperCase().replace(/\s+/g, "-").slice(0, 10),
+              active: !isStopped,
+              status: isStopped ? "STOPPED" : "ACTIVE",
+              is_stopped: isStopped,
+              user_count: 1
+            });
+          } else {
+            const existing = storeMap.get(key);
+            existing.user_count = (existing.user_count || 0) + 1;
+          }
+        }
+        return Array.from(storeMap.values());
+      }
+    } catch (_) {
+    }
+    return [];
+  }
+  static async updateStoreInCloud(storeIdOrName, updates) {
+    const client = this.checkSupabase();
+    const isStopped = updates.status === "STOPPED" || updates.active === false || updates.is_blocked === true;
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    let storeUpdated = false;
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(storeIdOrName);
+      let query = client.from("stores").update({
+        active: !isStopped,
+        status: isStopped ? "STOPPED" : "ACTIVE",
+        is_blocked: Boolean(isStopped),
+        plan_status: isStopped ? "EXPIRED" : "ACTIVE",
+        updated_at: now
+      });
+      if (isUuid) {
+        query = query.eq("id", storeIdOrName);
+      } else {
+        query = query.ilike("name", storeIdOrName);
+      }
+      const { data, error } = await query.select();
+      if (!error && data && data.length > 0) {
+        storeUpdated = true;
+      }
+    } catch (_) {
+    }
+    try {
+      const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(storeIdOrName);
+      const userUpdates = {
+        store_status: isStopped ? "STOPPED" : "ACTIVE",
+        store_active: !isStopped,
+        updated_at: now
+      };
+      if (isUuid) {
+        const res = await client.from("users").update(userUpdates).eq("store_id", storeIdOrName).select();
+        if (!res.error && res.data && res.data.length > 0) storeUpdated = true;
+      } else {
+        const res = await client.from("users").update(userUpdates).ilike("store_name", storeIdOrName).select();
+        if (!res.error && res.data && res.data.length > 0) storeUpdated = true;
+      }
+    } catch (_) {
+    }
+    return storeUpdated;
+  }
+  static async isStoreStoppedInCloud(storeIdOrName) {
+    const store = await this.getStoreFromCloud(storeIdOrName);
+    if (store) {
+      return store.is_stopped;
+    }
+    return false;
   }
   // ============================================================
   // STORE & BUSINESS OPERATIONS (Delegated to Local SQLite Ledger)
@@ -2712,7 +3571,27 @@ function verifyToken(token) {
   }
 }
 var activeSessions = /* @__PURE__ */ new Map();
-function safeUser(u) {
+function getPermissionsSync(userId, role) {
+  const allTabs = ["billing", "inventory", "movements", "sales", "cash_control", "customers", "expenses", "reports", "dashboard", "employees", "audit", "settings"];
+  if (role === "ADMIN" || role === "DEVELOPER") {
+    return allTabs;
+  }
+  try {
+    const rawDb = LocalDb.getRawDb();
+    const row = rawDb.prepare("SELECT permissions_json FROM employee_tab_permissions WHERE user_id = ?").get(userId);
+    if (row?.permissions_json) {
+      return JSON.parse(row.permissions_json);
+    }
+    const uRow = rawDb.prepare("SELECT permissions_json FROM users WHERE id = ?").get(userId);
+    if (uRow?.permissions_json) {
+      return JSON.parse(uRow.permissions_json);
+    }
+  } catch (_) {
+  }
+  return ["billing", "inventory", "sales", "movements", "cash_control", "customers"];
+}
+function safeUser(u, permissions) {
+  const effectivePermissions = permissions || getPermissionsSync(u.id, u.role);
   return {
     id: u.id,
     store_id: u.store_id,
@@ -2721,7 +3600,8 @@ function safeUser(u) {
     role: u.role,
     active: u.active,
     last_login_at: u.last_login_at,
-    created_at: u.created_at
+    created_at: u.created_at,
+    permissions: effectivePermissions
   };
 }
 var AuthService = class {
@@ -2820,8 +3700,8 @@ var AuthService = class {
       });
       throw new Error("Invalid email or password");
     }
-    const isBlocked = user.active === false || user.is_blocked === true || user.status === "BLOCKED" || user.status === "INACTIVE";
-    if (isBlocked) {
+    const isUserBlocked = user.active === false || user.is_blocked === true || ["BLOCKED", "INACTIVE", "SUSPENDED"].includes(String(user.status || "").toUpperCase());
+    if (isUserBlocked) {
       AuditService.log({
         storeId: user.store_id,
         userId: user.id,
@@ -2829,6 +3709,46 @@ var AuthService = class {
         action: "LOGIN_BLOCKED_INACTIVE",
         entityType: "AUTH",
         afterData: { email: cleanEmail, reason: "contact admin and renew the plan" },
+        ipAddress: ip,
+        userAgent
+      });
+      throw new Error("contact admin and renew the plan");
+    }
+    const storeLookupKey = user.store_id || user.store_name;
+    let cloudStore = storeLookupKey ? await SupabaseDb.getStoreFromCloud(storeLookupKey) : null;
+    if (!cloudStore && user.store_name) {
+      cloudStore = await SupabaseDb.getStoreFromCloud(user.store_name);
+    }
+    if (cloudStore && cloudStore.is_stopped) {
+      AuditService.log({
+        storeId: cloudStore.id,
+        userId: user.id,
+        userName: user.name,
+        action: "LOGIN_BLOCKED_STORE_STOPPED",
+        entityType: "AUTH",
+        afterData: {
+          email: cleanEmail,
+          storeName: cloudStore.name,
+          storeStatus: cloudStore.status,
+          reason: "contact admin and renew the plan"
+        },
+        ipAddress: ip,
+        userAgent
+      });
+      throw new Error("contact admin and renew the plan");
+    }
+    if (user.is_store_stopped) {
+      AuditService.log({
+        storeId: user.store_id,
+        userId: user.id,
+        userName: user.name,
+        action: "LOGIN_BLOCKED_STORE_STOPPED",
+        entityType: "AUTH",
+        afterData: {
+          email: cleanEmail,
+          storeName: user.store_name || user.store_id,
+          reason: "contact admin and renew the plan"
+        },
         ipAddress: ip,
         userAgent
       });
@@ -2852,7 +3772,27 @@ var AuthService = class {
     const now = (/* @__PURE__ */ new Date()).toISOString();
     await SupabaseDb.updateUser(user.id, { last_login_at: now }).catch(() => {
     });
-    const primaryStore = await LocalDb.getFirstStore() || await LocalDb.getStore(user.store_id);
+    const effectiveStoreName = cloudStore?.name || user.store_name;
+    let syncedStore = null;
+    if (effectiveStoreName) {
+      try {
+        syncedStore = await LocalDb.syncStoreFromCloud({
+          id: cloudStore?.id || user.store_id,
+          name: effectiveStoreName,
+          code: cloudStore?.code,
+          address: cloudStore?.address,
+          phone: cloudStore?.phone,
+          email: cloudStore?.email,
+          gstin: cloudStore?.gstin,
+          currency: cloudStore?.currency || "INR",
+          invoice_prefix: cloudStore?.invoice_prefix
+        });
+        await db.syncFromLocalDb();
+      } catch (syncErr) {
+        console.warn("[StoreSync] Notice syncing store from cloud:", syncErr);
+      }
+    }
+    const primaryStore = syncedStore || await LocalDb.getFirstStore() || await LocalDb.getStore(user.store_id);
     if (primaryStore) {
       user.store_id = primaryStore.id;
     }
@@ -2902,7 +3842,8 @@ var AuthService = class {
         role: session.role,
         active: true,
         last_login_at: void 0,
-        created_at: new Date(session.createdAt).toISOString()
+        created_at: new Date(session.createdAt).toISOString(),
+        permissions: getPermissionsSync(session.userId, session.role)
       },
       store,
       session
@@ -3683,432 +4624,15 @@ var InventoryService = class {
 // server/services/billingService.ts
 init_db();
 init_localDb();
-import crypto8 from "crypto";
-function round2(num) {
-  return Math.round((num + Number.EPSILON) * 100) / 100;
-}
-var BillingService = class {
-  static async createSale(params) {
-    const { storeId, userId, userName, payload } = params;
-    if (!payload.items || !Array.isArray(payload.items) || payload.items.length === 0) {
-      throw new Error("Sale must contain at least one item");
-    }
-    const validPaymentMethods = ["CASH", "UPI", "CARD", "OTHER"];
-    if (!validPaymentMethods.includes(payload.paymentMethod)) {
-      throw new Error("Invalid payment method");
-    }
-    const gstType = payload.gstType || "INTRA_STATE";
-    const globalTaxMode = payload.taxMode;
-    const totalQtyMap = /* @__PURE__ */ new Map();
-    for (const item of payload.items) {
-      const q = Number(item.quantity);
-      if (isNaN(q) || q <= 0) throw new Error("All item quantities must be greater than zero");
-      totalQtyMap.set(item.productId, (totalQtyMap.get(item.productId) || 0) + q);
-    }
-    for (const [productId, totalQty] of totalQtyMap.entries()) {
-      const product = db.products.find((p) => p.id === productId && p.store_id === storeId);
-      if (!product) throw new Error(`Product not found with ID ${productId}`);
-      if (!product.active) throw new Error(`Product "${product.name}" is deactivated and cannot be sold`);
-      if (product.current_stock < totalQty) {
-        throw new Error(`Insufficient stock for "${product.name}". Available: ${product.current_stock}, requested: ${totalQty}`);
-      }
-    }
-    const rawDb = (await Promise.resolve().then(() => (init_localDb(), localDb_exports))).localDbManager.getRawDb();
-    const verifiedProducts = [];
-    let calculatedSubtotal = 0;
-    let calculatedTax = 0;
-    let totalCGST = 0;
-    let totalSGST = 0;
-    let totalIGST = 0;
-    for (const item of payload.items) {
-      const product = db.products.find((p) => p.id === item.productId && p.store_id === storeId);
-      const qty = Number(item.quantity);
-      let modExtraPaise = 0;
-      const enrichedModifiers = [];
-      if (item.selectedModifiers && Array.isArray(item.selectedModifiers)) {
-        for (const selMod of item.selectedModifiers) {
-          const modRow = rawDb.prepare("SELECT * FROM modifiers WHERE id = ?").get(selMod.modifierId);
-          if (modRow) {
-            const modQty = Number(selMod.quantity) || 1;
-            modExtraPaise += (modRow.additional_price_minor || 0) * modQty;
-            enrichedModifiers.push({
-              modifierId: modRow.id,
-              modifierName: modRow.name,
-              additionalPriceMinor: modRow.additional_price_minor,
-              quantity: modQty
-            });
-          }
-        }
-      }
-      const unitPrice = round2(product.selling_price + modExtraPaise / 100);
-      let taxRate = round2(product.tax_rate || 0);
-      if (gstType === "EXEMPT") taxRate = 0;
-      const chosenTaxType = item.taxType || (globalTaxMode && globalTaxMode !== "AUTO" ? globalTaxMode : product.tax_type) || "EXCLUSIVE";
-      let lineSubtotal, lineTax, lineTotal;
-      if (chosenTaxType === "INCLUSIVE" && taxRate > 0) {
-        lineTotal = round2(qty * unitPrice);
-        lineSubtotal = round2(lineTotal / (1 + taxRate / 100));
-        lineTax = round2(lineTotal - lineSubtotal);
-      } else {
-        lineSubtotal = round2(qty * unitPrice);
-        lineTax = round2(lineSubtotal * (taxRate / 100));
-        lineTotal = round2(lineSubtotal + lineTax);
-      }
-      let itemCGST = 0, itemSGST = 0, itemIGST = 0;
-      if (gstType === "INTER_STATE") {
-        itemIGST = lineTax;
-      } else if (gstType === "INTRA_STATE") {
-        itemCGST = round2(lineTax / 2);
-        itemSGST = round2(lineTax - itemCGST);
-      }
-      calculatedSubtotal = round2(calculatedSubtotal + lineSubtotal);
-      calculatedTax = round2(calculatedTax + lineTax);
-      totalCGST = round2(totalCGST + itemCGST);
-      totalSGST = round2(totalSGST + itemSGST);
-      totalIGST = round2(totalIGST + itemIGST);
-      verifiedProducts.push({
-        product,
-        quantity: qty,
-        unitPrice,
-        taxRate,
-        taxType: chosenTaxType,
-        lineSubtotal,
-        lineTax,
-        lineTotal,
-        cgst: itemCGST,
-        sgst: itemSGST,
-        igst: itemIGST,
-        selectedModifiers: enrichedModifiers.length > 0 ? enrichedModifiers : void 0
-      });
-    }
-    let appliedDiscount = round2(Math.max(0, Number(payload.discount) || 0));
-    if (appliedDiscount > calculatedSubtotal + calculatedTax) {
-      throw new Error("Discount cannot exceed the total bill amount");
-    }
-    const netBeforeRound = calculatedSubtotal + calculatedTax - appliedDiscount;
-    const roundedTotal = Math.round(netBeforeRound);
-    const roundOff = round2(roundedTotal - netBeforeRound);
-    const billNumber = await db.getNextBillNumberAsync(storeId);
-    const verificationToken = crypto8.randomUUID();
-    const saleId = crypto8.randomUUID();
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const saleItems = [];
-    const stockMovements = [];
-    for (const vp of verifiedProducts) {
-      const { product, quantity, unitPrice, taxRate, lineSubtotal, lineTax, lineTotal, cgst, sgst, igst, selectedModifiers } = vp;
-      const beforeStock = product.current_stock;
-      const afterStock = beforeStock - quantity;
-      product.current_stock = afterStock;
-      product.updated_at = now;
-      saleItems.push({
-        id: crypto8.randomUUID(),
-        sale_id: saleId,
-        product_id: product.id,
-        product_name_snapshot: product.name,
-        sku_snapshot: product.sku,
-        barcode_snapshot: product.barcode,
-        hsn_snapshot: product.hsn_code || "",
-        quantity,
-        unit_price: unitPrice,
-        purchase_price_snapshot: product.purchase_price,
-        tax_rate: taxRate,
-        tax_amount: lineTax,
-        tax_type_snapshot: vp.taxType,
-        taxable_value: lineSubtotal,
-        cgst_amount: cgst,
-        sgst_amount: sgst,
-        igst_amount: igst,
-        discount: 0,
-        line_total: lineTotal,
-        selected_modifiers: selectedModifiers,
-        created_at: now
-      });
-      stockMovements.push({
-        store_id: storeId,
-        product_id: product.id,
-        product_name: product.name,
-        user_id: userId,
-        user_name: userName,
-        type: "SALE",
-        quantity: -quantity,
-        before_stock: beforeStock,
-        after_stock: afterStock,
-        reason: `Sold on bill #${billNumber}`,
-        reference_type: "SALE",
-        reference_id: saleId
-      });
-    }
-    try {
-      const rawDb2 = (await Promise.resolve().then(() => (init_localDb(), localDb_exports))).localDbManager.getRawDb();
-      for (const item of payload.items) {
-        const qty = Number(item.quantity) || 1;
-        const recipeVer = rawDb2.prepare(`
-          SELECT id FROM recipe_versions WHERE product_id = ? AND status = 'active'
-        `).get(item.productId);
-        if (recipeVer) {
-          const recipeIngs = rawDb2.prepare(`
-            SELECT * FROM recipe_ingredients WHERE recipe_version_id = ?
-          `).all(recipeVer.id);
-          for (const ing of recipeIngs) {
-            const deltaBase = ing.quantity_per_serving_base * qty;
-            const curItem = rawDb2.prepare("SELECT * FROM inventory_items WHERE id = ?").get(ing.inventory_item_id);
-            if (curItem) {
-              const resStock = curItem.current_stock_base - deltaBase;
-              rawDb2.prepare(`
-                INSERT INTO inventory_movements (
-                  id, inventory_item_id, movement_type, quantity_delta_base,
-                  resulting_quantity_base, unit_cost_snapshot, total_cost_minor,
-                  reference_type, reference_id, reason, created_at, created_by
-                ) VALUES (?, ?, 'sale_consumption', ?, ?, ?, ?, 'sale', ?, ?, ?, ?)
-              `).run(
-                crypto8.randomUUID(),
-                curItem.id,
-                -deltaBase,
-                resStock,
-                curItem.weighted_average_unit_cost_minor,
-                Math.round(deltaBase * curItem.weighted_average_unit_cost_minor),
-                saleId,
-                `POS Sale ${billNumber}`,
-                now,
-                userName
-              );
-              rawDb2.prepare("UPDATE inventory_items SET current_stock_base = ? WHERE id = ?").run(resStock, curItem.id);
-            }
-          }
-        }
-        if (item.selectedModifiers && Array.isArray(item.selectedModifiers)) {
-          for (const modSel of item.selectedModifiers) {
-            const modQty = Number(modSel.quantity) || 1;
-            const modIngs = rawDb2.prepare(`
-              SELECT * FROM modifier_ingredients WHERE modifier_id = ?
-            `).all(modSel.modifierId);
-            for (const mIng of modIngs) {
-              const deltaMod = mIng.quantity_per_modifier_base * modQty * qty;
-              const curItem = rawDb2.prepare("SELECT * FROM inventory_items WHERE id = ?").get(mIng.inventory_item_id);
-              if (curItem) {
-                const resStock = curItem.current_stock_base - deltaMod;
-                rawDb2.prepare(`
-                  INSERT INTO inventory_movements (
-                    id, inventory_item_id, movement_type, quantity_delta_base,
-                    resulting_quantity_base, unit_cost_snapshot, total_cost_minor,
-                    reference_type, reference_id, reason, created_at, created_by
-                  ) VALUES (?, ?, 'sale_consumption', ?, ?, ?, ?, 'sale', ?, ?, ?, ?)
-                `).run(
-                  crypto8.randomUUID(),
-                  curItem.id,
-                  -deltaMod,
-                  resStock,
-                  curItem.weighted_average_unit_cost_minor,
-                  Math.round(deltaMod * curItem.weighted_average_unit_cost_minor),
-                  saleId,
-                  `POS Sale ${billNumber} Modifier`,
-                  now,
-                  userName
-                );
-                rawDb2.prepare("UPDATE inventory_items SET current_stock_base = ? WHERE id = ?").run(resStock, curItem.id);
-              }
-            }
-          }
-        }
-      }
-    } catch (err) {
-      console.warn("BOM ledger stock depletion notice:", err);
-    }
-    const newSale = {
-      id: saleId,
-      store_id: storeId,
-      bill_number: billNumber,
-      verification_token: verificationToken,
-      employee_id: userId,
-      employee_name: userName,
-      subtotal: calculatedSubtotal,
-      discount: appliedDiscount,
-      tax: calculatedTax,
-      cgst: totalCGST,
-      sgst: totalSGST,
-      igst: totalIGST,
-      gst_type: gstType,
-      tax_mode: payload.taxMode,
-      round_off: roundOff,
-      customer_name: payload.customerName?.trim() || void 0,
-      customer_phone: payload.customerPhone?.trim() || void 0,
-      customer_gstin: payload.customerGstin?.trim().toUpperCase() || void 0,
-      total: roundedTotal,
-      payment_method: payload.paymentMethod,
-      status: "COMPLETED",
-      notes: payload.notes?.trim() || void 0,
-      created_at: now,
-      items: saleItems
-    };
-    if (isSupabaseConfigured) {
-      let saved;
-      try {
-        const [saleResult] = await Promise.all([
-          SupabaseDb.createSale(
-            { ...newSale, items: void 0 },
-            saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
-          ),
-          SupabaseDb.createStockMovementsBatch(stockMovements).catch((err) => {
-            console.error("Stock movements batch error:", err);
-          }),
-          Promise.all(
-            verifiedProducts.map(
-              (vp) => SupabaseDb.updateProduct(vp.product.id, {
-                current_stock: vp.product.current_stock,
-                updated_at: now
-              }).catch(() => {
-              })
-            )
-          )
-        ]);
-        saved = saleResult;
-      } catch (insertErr) {
-        const msg = String(insertErr?.message || "");
-        if (msg.includes("sales_bill_number_key") || msg.includes("unique constraint") || msg.includes("duplicate key")) {
-          console.warn("Bill number collision detected, generating next sequence and retrying...");
-          const retryBillNumber = await db.getNextBillNumberAsync(storeId);
-          newSale.bill_number = retryBillNumber;
-          saved = await SupabaseDb.createSale(
-            { ...newSale, items: void 0 },
-            saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
-          );
-        } else {
-          throw insertErr;
-        }
-      }
-      db.sales.unshift(saved);
-      db.sale_items.push(...saleItems);
-      db.stock_movements.unshift(...stockMovements);
-    } else {
-      const saved = await LocalDb.createSale(
-        { ...newSale, items: void 0 },
-        saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
-      );
-      await LocalDb.createStockMovementsBatch(stockMovements);
-      for (const vp of verifiedProducts) {
-        await LocalDb.updateProduct(vp.product.id, {
-          current_stock: vp.product.current_stock,
-          updated_at: now
-        });
-      }
-      db.sales.unshift(saved);
-      db.sale_items.push(...saleItems);
-      db.stock_movements.unshift(...stockMovements);
-    }
-    AuditService.log({
-      storeId,
-      userId,
-      userName,
-      action: "SALE_CREATED",
-      entityType: "SALE",
-      entityId: newSale.id,
-      afterData: { billNumber: newSale.bill_number, total: newSale.total, paymentMethod: newSale.payment_method, itemCount: saleItems.length }
-    });
-    return { ...newSale, items: saleItems };
-  }
-  static async voidSale(params) {
-    const { storeId, userId, userName, saleId, reason } = params;
-    if (!reason || reason.trim().length === 0) throw new Error("A reason is mandatory for voiding a bill");
-    const sale = db.sales.find((s) => s.id === saleId && s.store_id === storeId);
-    if (!sale) throw new Error("Sale record not found");
-    if (sale.status === "VOIDED") throw new Error("This bill is already voided");
-    const saleItemsForSale = db.sale_items.filter((si) => si.sale_id === sale.id);
-    const now = (/* @__PURE__ */ new Date()).toISOString();
-    const stockRestores = [];
-    for (const item of saleItemsForSale) {
-      const product = db.products.find((p) => p.id === item.product_id && p.store_id === storeId);
-      if (product) {
-        const beforeStock = product.current_stock;
-        const afterStock = beforeStock + item.quantity;
-        product.current_stock = afterStock;
-        product.updated_at = now;
-        stockRestores.push({ productId: product.id, newStock: afterStock });
-        const voidMov = {
-          store_id: storeId,
-          product_id: product.id,
-          product_name: product.name,
-          user_id: userId,
-          user_name: userName,
-          type: "VOID",
-          quantity: item.quantity,
-          before_stock: beforeStock,
-          after_stock: afterStock,
-          reason: `Stock restored from voided bill #${sale.bill_number}: ${reason.trim()}`,
-          reference_type: "SALE_VOID",
-          reference_id: sale.id
-        };
-        if (isSupabaseConfigured) {
-          SupabaseDb.createStockMovement(voidMov).catch(() => {
-          });
-          SupabaseDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {
-          });
-        } else {
-          LocalDb.createStockMovement(voidMov).catch(() => {
-          });
-          LocalDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {
-          });
-        }
-        db.stock_movements.unshift(voidMov);
-      }
-    }
-    sale.status = "VOIDED";
-    sale.voided_at = now;
-    sale.voided_by = userId;
-    sale.voided_by_name = userName;
-    sale.void_reason = reason.trim();
-    if (isSupabaseConfigured) {
-      await SupabaseDb.voidSale(saleId, userId, userName, reason.trim());
-    } else {
-      await LocalDb.voidSale(saleId, userId, userName, reason.trim());
-    }
-    AuditService.log({
-      storeId,
-      userId,
-      userName,
-      action: "SALE_VOIDED",
-      entityType: "SALE",
-      entityId: sale.id,
-      afterData: { billNumber: sale.bill_number, voidReason: sale.void_reason, voidedAt: sale.voided_at }
-    });
-    return sale;
-  }
-  static getSales(storeId, options) {
-    let list = db.sales.filter((s) => s.store_id === storeId);
-    if (options?.employeeId) list = list.filter((s) => s.employee_id === options.employeeId);
-    if (options?.paymentMethod) list = list.filter((s) => s.payment_method === options.paymentMethod);
-    if (options?.status) list = list.filter((s) => s.status === options.status);
-    if (options?.search) {
-      const q = options.search.trim().toLowerCase();
-      list = list.filter(
-        (s) => s.bill_number.toLowerCase().includes(q) || s.employee_name.toLowerCase().includes(q) || s.notes && s.notes.toLowerCase().includes(q)
-      );
-    }
-    if (options?.from) {
-      const fromDate = new Date(options.from).getTime();
-      list = list.filter((s) => new Date(s.created_at).getTime() >= fromDate);
-    }
-    if (options?.to) {
-      const toDate = new Date(options.to).getTime() + 864e5;
-      list = list.filter((s) => new Date(s.created_at).getTime() <= toDate);
-    }
-    const limit = options?.limit || 200;
-    return list.slice(0, limit).map((s) => ({
-      ...s,
-      items: db.sale_items.filter((si) => si.sale_id === s.id)
-    }));
-  }
-  static getSaleById(storeId, saleId) {
-    const sale = db.sales.find((s) => s.id === saleId && s.store_id === storeId);
-    if (!sale) throw new Error("Sale not found");
-    const items = db.sale_items.filter((si) => si.sale_id === sale.id);
-    return { ...sale, items };
-  }
-};
+
+// server/services/cashControlService.ts
+init_localDb();
+import crypto9 from "crypto";
 
 // server/services/employeeService.ts
 init_db();
 init_localDb();
-import crypto9 from "crypto";
+import crypto8 from "crypto";
 var EmployeeService = class {
   /**
    * List staff records. Only returns developer profiles if the requesting caller is a DEVELOPER.
@@ -4141,7 +4665,7 @@ var EmployeeService = class {
     const passwordHash = hashPassword(payload.password, salt);
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const newEmp = {
-      id: crypto9.randomUUID(),
+      id: crypto8.randomUUID(),
       store_id: storeId,
       name: rawUsername,
       email: canonicalEmail,
@@ -4174,7 +4698,9 @@ var EmployeeService = class {
     if (existing) {
       throw new Error(`Username "${rawUsername}" is already taken in the cloud database`);
     }
-    const saved = await SupabaseDb.createUser(newEmp);
+    const currentStore = await LocalDb.getStore(storeId) || await LocalDb.getFirstStore();
+    const storeName = currentStore?.name || "Frozen Bowl";
+    const saved = await SupabaseDb.createUser(newEmp, storeName);
     AuditService.log({
       storeId,
       userId: adminUserId,
@@ -4290,6 +4816,25 @@ var EmployeeService = class {
     });
     return { success: true, message: `Staff member "${user.name}" removed` };
   }
+  static async getEmployeePermissions(storeId, employeeId) {
+    return LocalDb.getEmployeePermissions(employeeId, storeId);
+  }
+  static async updateEmployeePermissions(storeId, adminUserId, adminUserName, employeeId, permissions) {
+    if (!Array.isArray(permissions)) {
+      throw new Error("Permissions must be an array of tab names");
+    }
+    await LocalDb.setEmployeePermissions(employeeId, storeId, permissions);
+    AuditService.log({
+      storeId,
+      userId: adminUserId,
+      userName: adminUserName,
+      action: "EMPLOYEE_PERMISSIONS_UPDATED",
+      entityType: "USER",
+      entityId: employeeId,
+      afterData: { permissions }
+    });
+    return { success: true, permissions };
+  }
 };
 var ExpenseService = class {
   static listExpenses(storeId, options) {
@@ -4361,6 +4906,773 @@ var ExpenseService = class {
       afterData: { category: exp.category, amount: exp.amount, status: "VOIDED" }
     });
     return exp;
+  }
+};
+
+// server/services/cashControlService.ts
+var CashControlService = class {
+  /**
+   * Get active open cash drawer session for the store, along with all shift transactions and last closed session.
+   */
+  static async getCurrentSession(storeId) {
+    const session = await LocalDb.getActiveCashDrawerSession(storeId);
+    const lastClosedSession = await LocalDb.getLastClosedCashDrawerSession(storeId);
+    if (!session) {
+      return { session: null, transactions: [], lastClosedSession };
+    }
+    const transactions = await LocalDb.getCashDrawerTransactions(session.id);
+    const expected = Number(
+      (Number(session.opening_amount || 0) + Number(session.cash_sales_amount || 0) + Number(session.cash_in_amount || 0) - Number(session.cash_out_amount || 0)).toFixed(2)
+    );
+    if (session.expected_amount !== expected) {
+      await LocalDb.updateCashDrawerSession(session.id, { expected_amount: expected });
+      session.expected_amount = expected;
+    }
+    return { session, transactions, lastClosedSession };
+  }
+  /**
+   * Open a new cash drawer shift session.
+   * If openingAmount is not provided, it automatically inherits the closing balance of the last session.
+   */
+  static async openSession(storeId, userId, userName, payload) {
+    const existing = await LocalDb.getActiveCashDrawerSession(storeId);
+    if (existing) {
+      throw new Error("A cash drawer shift is already OPEN for this counter. Please close the active shift first.");
+    }
+    const lastClosed = await LocalDb.getLastClosedCashDrawerSession(storeId);
+    let openingAmount = payload.openingAmount !== void 0 && payload.openingAmount !== null ? Number(payload.openingAmount) : lastClosed ? Number(lastClosed.closing_amount || 0) : 0;
+    if (isNaN(openingAmount) || openingAmount < 0) {
+      throw new Error("Opening cash amount must be zero or a positive number");
+    }
+    let denominations = payload.denominations;
+    if (!denominations && lastClosed?.closing_denominations_json) {
+      try {
+        denominations = JSON.parse(lastClosed.closing_denominations_json);
+      } catch (_) {
+      }
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const sessionId = crypto9.randomUUID();
+    const denominationsJson = JSON.stringify(denominations || {});
+    const session = await LocalDb.createCashDrawerSession({
+      id: sessionId,
+      store_id: storeId,
+      opened_by: userId,
+      opened_by_name: userName || "Cashier",
+      opened_at: now,
+      opening_amount: openingAmount,
+      opening_denominations_json: denominationsJson,
+      opening_notes: payload.notes?.trim() || (lastClosed ? `Carried forward from last shift (\u20B9${Number(lastClosed.closing_amount || 0).toFixed(2)})` : ""),
+      expected_amount: openingAmount,
+      cash_sales_amount: 0,
+      cash_in_amount: 0,
+      cash_out_amount: 0,
+      difference: 0,
+      status: "OPEN"
+    });
+    const transaction = await LocalDb.createCashDrawerTransaction({
+      session_id: session.id,
+      store_id: storeId,
+      type: "OPENING_FLOAT",
+      amount: openingAmount,
+      category: "Float",
+      reason: lastClosed ? `Shift Opening Float (Carried forward from last shift \u20B9${Number(lastClosed.closing_amount || 0).toFixed(2)})` : "Shift Opening Float",
+      performed_by: userId,
+      performed_by_name: userName || "Cashier",
+      notes: payload.notes?.trim() || "Initial cash in counter drawer"
+    });
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "CASH_DRAWER_OPENED",
+      entityType: "CASH_DRAWER",
+      entityId: session.id,
+      afterData: {
+        openingAmount,
+        denominations,
+        notes: payload.notes,
+        carriedForwardFromSessionId: lastClosed?.id
+      }
+    });
+    return { session, transaction };
+  }
+  /**
+   * Add cash to counter drawer (Float top-up).
+   */
+  static async addCashIn(storeId, userId, userName, payload) {
+    const session = await LocalDb.getActiveCashDrawerSession(storeId);
+    if (!session) {
+      throw new Error("No active cash drawer session is open. Please open a shift first.");
+    }
+    const amt = Number(payload.amount);
+    if (isNaN(amt) || amt <= 0) {
+      throw new Error("Cash In amount must be greater than zero");
+    }
+    const newCashIn = Number((Number(session.cash_in_amount || 0) + amt).toFixed(2));
+    const newExpected = Number((Number(session.expected_amount || 0) + amt).toFixed(2));
+    const updatedSession = await LocalDb.updateCashDrawerSession(session.id, {
+      cash_in_amount: newCashIn,
+      expected_amount: newExpected
+    });
+    const transaction = await LocalDb.createCashDrawerTransaction({
+      session_id: session.id,
+      store_id: storeId,
+      type: "CASH_IN",
+      amount: amt,
+      category: "Float In",
+      reason: payload.reason?.trim() || "Cash Float Addition",
+      performed_by: userId,
+      performed_by_name: userName || "Staff",
+      notes: payload.notes?.trim() || ""
+    });
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "CASH_DRAWER_CASH_IN",
+      entityType: "CASH_DRAWER",
+      entityId: session.id,
+      afterData: { amount: amt, reason: payload.reason, newExpected }
+    });
+    return { session: updatedSession, transaction };
+  }
+  /**
+   * Remove cash from counter drawer for expenses (Petty cash / vendor payments / local supplies).
+   * Automatically creates an entry in the store's expenses table.
+   */
+  static async addCashOut(storeId, userId, userName, payload) {
+    const session = await LocalDb.getActiveCashDrawerSession(storeId);
+    if (!session) {
+      throw new Error("No active cash drawer session is open. Please open a shift first.");
+    }
+    const amt = Number(payload.amount);
+    if (isNaN(amt) || amt <= 0) {
+      throw new Error("Cash Out amount must be greater than zero");
+    }
+    const currentExpected = Number(session.expected_amount || 0);
+    if (amt > currentExpected) {
+      console.warn(`[CashControl] Cash out \u20B9${amt} exceeds expected counter cash \u20B9${currentExpected}`);
+    }
+    const newCashOut = Number((Number(session.cash_out_amount || 0) + amt).toFixed(2));
+    const newExpected = Number((Number(session.expected_amount || 0) - amt).toFixed(2));
+    const updatedSession = await LocalDb.updateCashDrawerSession(session.id, {
+      cash_out_amount: newCashOut,
+      expected_amount: newExpected
+    });
+    const category = payload.category?.trim() || "Counter Expense";
+    const reason = payload.reason?.trim() || "Cash Payout from Drawer";
+    const transaction = await LocalDb.createCashDrawerTransaction({
+      session_id: session.id,
+      store_id: storeId,
+      type: "CASH_OUT",
+      amount: amt,
+      category,
+      reason,
+      performed_by: userId,
+      performed_by_name: userName || "Staff",
+      notes: payload.notes?.trim() || ""
+    });
+    let expenseRecord = null;
+    try {
+      expenseRecord = await ExpenseService.createExpense(storeId, userId, userName, {
+        category,
+        amount: amt,
+        description: `[Counter Drawer Cash Out] ${reason}${payload.notes ? ` - ${payload.notes}` : ""}`,
+        expenseDate: (/* @__PURE__ */ new Date()).toISOString().split("T")[0]
+      });
+    } catch (expErr) {
+      console.error("[CashControl] Failed to auto-create expense record:", expErr);
+    }
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "CASH_DRAWER_CASH_OUT",
+      entityType: "CASH_DRAWER",
+      entityId: session.id,
+      afterData: {
+        amount: amt,
+        category,
+        reason,
+        notes: payload.notes,
+        newExpected,
+        expenseId: expenseRecord?.id
+      }
+    });
+    return { session: updatedSession, transaction, expense: expenseRecord };
+  }
+  /**
+   * Record a CASH sale in the active drawer session.
+   * Called automatically from billingService.ts when payment_method === 'CASH'.
+   */
+  static async recordSaleIfSessionOpen(storeId, sale, userId, userName) {
+    if (sale.payment_method !== "CASH") return;
+    try {
+      const session = await LocalDb.getActiveCashDrawerSession(storeId);
+      if (!session) return;
+      const saleAmount = Number(sale.total) || 0;
+      const newCashSales = Number((Number(session.cash_sales_amount || 0) + saleAmount).toFixed(2));
+      const newExpected = Number((Number(session.expected_amount || 0) + saleAmount).toFixed(2));
+      await LocalDb.updateCashDrawerSession(session.id, {
+        cash_sales_amount: newCashSales,
+        expected_amount: newExpected
+      });
+      await LocalDb.createCashDrawerTransaction({
+        session_id: session.id,
+        store_id: storeId,
+        type: "SALE",
+        amount: saleAmount,
+        category: "Cash Sale",
+        reason: `Bill #${sale.bill_number}`,
+        reference_id: sale.id,
+        performed_by: userId,
+        performed_by_name: userName || "Cashier",
+        notes: `Items: ${sale.items?.length || 1}`
+      });
+    } catch (err) {
+      console.error("[CashControl] Error recording cash sale to drawer session:", err);
+    }
+  }
+  /**
+   * Record a CASH refund/void in the active drawer session.
+   */
+  static async recordVoidIfSessionOpen(storeId, sale, userId, userName, reason) {
+    if (sale.payment_method !== "CASH") return;
+    try {
+      const session = await LocalDb.getActiveCashDrawerSession(storeId);
+      if (!session) return;
+      const refundAmount = Number(sale.total) || 0;
+      const newCashSales = Number((Number(session.cash_sales_amount || 0) - refundAmount).toFixed(2));
+      const newExpected = Number((Number(session.expected_amount || 0) - refundAmount).toFixed(2));
+      await LocalDb.updateCashDrawerSession(session.id, {
+        cash_sales_amount: newCashSales,
+        expected_amount: newExpected
+      });
+      await LocalDb.createCashDrawerTransaction({
+        session_id: session.id,
+        store_id: storeId,
+        type: "REFUND",
+        amount: -refundAmount,
+        category: "Cash Refund",
+        reason: `Voided Bill #${sale.bill_number}: ${reason || "Customer refund"}`,
+        reference_id: sale.id,
+        performed_by: userId,
+        performed_by_name: userName || "Cashier",
+        notes: `Bill #${sale.bill_number}`
+      });
+    } catch (err) {
+      console.error("[CashControl] Error recording cash void to drawer session:", err);
+    }
+  }
+  /**
+   * End shift and close the cash drawer with actual physical denomination count.
+   */
+  static async closeSession(storeId, userId, userName, payload) {
+    const session = await LocalDb.getActiveCashDrawerSession(storeId);
+    if (!session) {
+      throw new Error("No active cash drawer session is open to close.");
+    }
+    const countedAmount = Number(payload.closingAmount);
+    if (isNaN(countedAmount) || countedAmount < 0) {
+      throw new Error("Closing cash amount must be zero or a positive number");
+    }
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const expected = Number(
+      (Number(session.opening_amount || 0) + Number(session.cash_sales_amount || 0) + Number(session.cash_in_amount || 0) - Number(session.cash_out_amount || 0)).toFixed(2)
+    );
+    const difference = Number((countedAmount - expected).toFixed(2));
+    const denominationsJson = JSON.stringify(payload.denominations || {});
+    const closedSession = await LocalDb.updateCashDrawerSession(session.id, {
+      closed_by: userId,
+      closed_by_name: userName || "Cashier",
+      closed_at: now,
+      closing_amount: countedAmount,
+      closing_denominations_json: denominationsJson,
+      closing_notes: payload.notes?.trim() || "",
+      expected_amount: expected,
+      difference,
+      status: "CLOSED"
+    });
+    const reconStatus = difference === 0 ? "BALANCED" : difference > 0 ? "SURPLUS" : "SHORTAGE";
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "CASH_DRAWER_CLOSED",
+      entityType: "CASH_DRAWER",
+      entityId: session.id,
+      afterData: {
+        expected,
+        countedAmount,
+        difference,
+        status: reconStatus,
+        denominations: payload.denominations,
+        notes: payload.notes
+      }
+    });
+    return {
+      session: closedSession,
+      reconciliation: {
+        expectedAmount: expected,
+        closingAmount: countedAmount,
+        difference,
+        status: reconStatus
+      }
+    };
+  }
+  /**
+   * List past shift sessions for audit and reconciliation logs.
+   */
+  static async listSessions(storeId, limit = 50) {
+    return LocalDb.listCashDrawerSessions(storeId, limit);
+  }
+  /**
+   * Get full session details by ID, including its transaction history.
+   */
+  static async getSessionDetails(storeId, sessionId) {
+    const session = await LocalDb.getCashDrawerSession(sessionId);
+    if (!session || session.store_id !== storeId) {
+      return { session: null, transactions: [] };
+    }
+    const transactions = await LocalDb.getCashDrawerTransactions(sessionId);
+    return { session, transactions };
+  }
+};
+
+// server/services/billingService.ts
+import crypto10 from "crypto";
+function round2(num) {
+  return Math.round((num + Number.EPSILON) * 100) / 100;
+}
+var BillingService = class {
+  static async createSale(params) {
+    const { storeId, userId, userName, payload } = params;
+    if (!payload.items || !Array.isArray(payload.items) || payload.items.length === 0) {
+      throw new Error("Sale must contain at least one item");
+    }
+    const validPaymentMethods = ["CASH", "UPI", "CARD", "OTHER"];
+    if (!validPaymentMethods.includes(payload.paymentMethod)) {
+      throw new Error("Invalid payment method");
+    }
+    const gstType = payload.gstType || "INTRA_STATE";
+    const globalTaxMode = payload.taxMode;
+    const rawDb = (await Promise.resolve().then(() => (init_localDb(), localDb_exports))).localDbManager.getRawDb();
+    const totalQtyMap = /* @__PURE__ */ new Map();
+    for (const item of payload.items) {
+      const q = Number(item.quantity);
+      if (isNaN(q) || q <= 0) throw new Error("All item quantities must be greater than zero");
+      totalQtyMap.set(item.productId, (totalQtyMap.get(item.productId) || 0) + q);
+    }
+    for (const [productId, totalQty] of totalQtyMap.entries()) {
+      let product = db.products.find((p) => p.id === productId && p.store_id === storeId);
+      if (!product) {
+        const row = rawDb.prepare("SELECT * FROM products WHERE id = ?").get(productId);
+        if (row) {
+          product = row;
+          db.products.push(row);
+        }
+      }
+      if (!product) throw new Error(`Product not found with ID ${productId}`);
+      if (!product.active) throw new Error(`Product "${product.name}" is deactivated and cannot be sold`);
+      if (product.current_stock < totalQty) {
+        throw new Error(`Insufficient stock for "${product.name}". Available: ${product.current_stock}, requested: ${totalQty}`);
+      }
+    }
+    const verifiedProducts = [];
+    let calculatedSubtotal = 0;
+    let calculatedTax = 0;
+    let totalCGST = 0;
+    let totalSGST = 0;
+    let totalIGST = 0;
+    for (const item of payload.items) {
+      const product = db.products.find((p) => p.id === item.productId && p.store_id === storeId);
+      const qty = Number(item.quantity);
+      let modExtraPaise = 0;
+      const enrichedModifiers = [];
+      if (item.selectedModifiers && Array.isArray(item.selectedModifiers)) {
+        for (const selMod of item.selectedModifiers) {
+          const modRow = rawDb.prepare("SELECT * FROM modifiers WHERE id = ?").get(selMod.modifierId);
+          if (modRow) {
+            const modQty = Number(selMod.quantity) || 1;
+            modExtraPaise += (modRow.additional_price_minor || 0) * modQty;
+            enrichedModifiers.push({
+              modifierId: modRow.id,
+              modifierName: modRow.name,
+              additionalPriceMinor: modRow.additional_price_minor,
+              quantity: modQty
+            });
+          }
+        }
+      }
+      const unitPrice = round2(product.selling_price + modExtraPaise / 100);
+      let taxRate = round2(product.tax_rate || 0);
+      if (gstType === "EXEMPT") taxRate = 0;
+      const chosenTaxType = item.taxType || (globalTaxMode && globalTaxMode !== "AUTO" ? globalTaxMode : product.tax_type) || "EXCLUSIVE";
+      let lineSubtotal, lineTax, lineTotal;
+      if (chosenTaxType === "INCLUSIVE" && taxRate > 0) {
+        lineTotal = round2(qty * unitPrice);
+        lineSubtotal = round2(lineTotal / (1 + taxRate / 100));
+        lineTax = round2(lineTotal - lineSubtotal);
+      } else {
+        lineSubtotal = round2(qty * unitPrice);
+        lineTax = round2(lineSubtotal * (taxRate / 100));
+        lineTotal = round2(lineSubtotal + lineTax);
+      }
+      let itemCGST = 0, itemSGST = 0, itemIGST = 0;
+      if (gstType === "INTER_STATE") {
+        itemIGST = lineTax;
+      } else if (gstType === "INTRA_STATE") {
+        itemCGST = round2(lineTax / 2);
+        itemSGST = round2(lineTax - itemCGST);
+      }
+      calculatedSubtotal = round2(calculatedSubtotal + lineSubtotal);
+      calculatedTax = round2(calculatedTax + lineTax);
+      totalCGST = round2(totalCGST + itemCGST);
+      totalSGST = round2(totalSGST + itemSGST);
+      totalIGST = round2(totalIGST + itemIGST);
+      verifiedProducts.push({
+        product,
+        quantity: qty,
+        unitPrice,
+        taxRate,
+        taxType: chosenTaxType,
+        lineSubtotal,
+        lineTax,
+        lineTotal,
+        cgst: itemCGST,
+        sgst: itemSGST,
+        igst: itemIGST,
+        selectedModifiers: enrichedModifiers.length > 0 ? enrichedModifiers : void 0
+      });
+    }
+    let appliedDiscount = round2(Math.max(0, Number(payload.discount) || 0));
+    if (appliedDiscount > calculatedSubtotal + calculatedTax) {
+      throw new Error("Discount cannot exceed the total bill amount");
+    }
+    const netBeforeRound = calculatedSubtotal + calculatedTax - appliedDiscount;
+    const roundedTotal = Math.round(netBeforeRound);
+    const roundOff = round2(roundedTotal - netBeforeRound);
+    const billNumber = await db.getNextBillNumberAsync(storeId);
+    const verificationToken = crypto10.randomUUID();
+    const saleId = crypto10.randomUUID();
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const saleItems = [];
+    const stockMovements = [];
+    for (const vp of verifiedProducts) {
+      const { product, quantity, unitPrice, taxRate, lineSubtotal, lineTax, lineTotal, cgst, sgst, igst, selectedModifiers } = vp;
+      const beforeStock = product.current_stock;
+      const afterStock = beforeStock - quantity;
+      product.current_stock = afterStock;
+      product.updated_at = now;
+      saleItems.push({
+        id: crypto10.randomUUID(),
+        sale_id: saleId,
+        product_id: product.id,
+        product_name_snapshot: product.name,
+        sku_snapshot: product.sku,
+        barcode_snapshot: product.barcode,
+        hsn_snapshot: product.hsn_code || "",
+        quantity,
+        unit_price: unitPrice,
+        purchase_price_snapshot: product.purchase_price,
+        tax_rate: taxRate,
+        tax_amount: lineTax,
+        tax_type_snapshot: vp.taxType,
+        taxable_value: lineSubtotal,
+        cgst_amount: cgst,
+        sgst_amount: sgst,
+        igst_amount: igst,
+        discount: 0,
+        line_total: lineTotal,
+        selected_modifiers: selectedModifiers,
+        created_at: now
+      });
+      stockMovements.push({
+        store_id: storeId,
+        product_id: product.id,
+        product_name: product.name,
+        user_id: userId,
+        user_name: userName,
+        type: "SALE",
+        quantity: -quantity,
+        before_stock: beforeStock,
+        after_stock: afterStock,
+        reason: `Sold on bill #${billNumber}`,
+        reference_type: "SALE",
+        reference_id: saleId
+      });
+    }
+    try {
+      const rawDb2 = (await Promise.resolve().then(() => (init_localDb(), localDb_exports))).localDbManager.getRawDb();
+      for (const item of payload.items) {
+        const qty = Number(item.quantity) || 1;
+        const recipeVer = rawDb2.prepare(`
+          SELECT id FROM recipe_versions WHERE product_id = ? AND status = 'active'
+        `).get(item.productId);
+        if (recipeVer) {
+          const recipeIngs = rawDb2.prepare(`
+            SELECT * FROM recipe_ingredients WHERE recipe_version_id = ?
+          `).all(recipeVer.id);
+          for (const ing of recipeIngs) {
+            const deltaBase = ing.quantity_per_serving_base * qty;
+            const curItem = rawDb2.prepare("SELECT * FROM inventory_items WHERE id = ?").get(ing.inventory_item_id);
+            if (curItem) {
+              const resStock = curItem.current_stock_base - deltaBase;
+              rawDb2.prepare(`
+                INSERT INTO inventory_movements (
+                  id, inventory_item_id, movement_type, quantity_delta_base,
+                  resulting_quantity_base, unit_cost_snapshot, total_cost_minor,
+                  reference_type, reference_id, reason, created_at, created_by
+                ) VALUES (?, ?, 'sale_consumption', ?, ?, ?, ?, 'sale', ?, ?, ?, ?)
+              `).run(
+                crypto10.randomUUID(),
+                curItem.id,
+                -deltaBase,
+                resStock,
+                curItem.weighted_average_unit_cost_minor,
+                Math.round(deltaBase * curItem.weighted_average_unit_cost_minor),
+                saleId,
+                `POS Sale ${billNumber}`,
+                now,
+                userName
+              );
+              rawDb2.prepare("UPDATE inventory_items SET current_stock_base = ? WHERE id = ?").run(resStock, curItem.id);
+            }
+          }
+        }
+        if (item.selectedModifiers && Array.isArray(item.selectedModifiers)) {
+          for (const modSel of item.selectedModifiers) {
+            const modQty = Number(modSel.quantity) || 1;
+            const modIngs = rawDb2.prepare(`
+              SELECT * FROM modifier_ingredients WHERE modifier_id = ?
+            `).all(modSel.modifierId);
+            for (const mIng of modIngs) {
+              const deltaMod = mIng.quantity_per_modifier_base * modQty * qty;
+              const curItem = rawDb2.prepare("SELECT * FROM inventory_items WHERE id = ?").get(mIng.inventory_item_id);
+              if (curItem) {
+                const resStock = curItem.current_stock_base - deltaMod;
+                rawDb2.prepare(`
+                  INSERT INTO inventory_movements (
+                    id, inventory_item_id, movement_type, quantity_delta_base,
+                    resulting_quantity_base, unit_cost_snapshot, total_cost_minor,
+                    reference_type, reference_id, reason, created_at, created_by
+                  ) VALUES (?, ?, 'sale_consumption', ?, ?, ?, ?, 'sale', ?, ?, ?, ?)
+                `).run(
+                  crypto10.randomUUID(),
+                  curItem.id,
+                  -deltaMod,
+                  resStock,
+                  curItem.weighted_average_unit_cost_minor,
+                  Math.round(deltaMod * curItem.weighted_average_unit_cost_minor),
+                  saleId,
+                  `POS Sale ${billNumber} Modifier`,
+                  now,
+                  userName
+                );
+                rawDb2.prepare("UPDATE inventory_items SET current_stock_base = ? WHERE id = ?").run(resStock, curItem.id);
+              }
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("BOM ledger stock depletion notice:", err);
+    }
+    const newSale = {
+      id: saleId,
+      store_id: storeId,
+      bill_number: billNumber,
+      verification_token: verificationToken,
+      employee_id: userId,
+      employee_name: userName,
+      subtotal: calculatedSubtotal,
+      discount: appliedDiscount,
+      tax: calculatedTax,
+      cgst: totalCGST,
+      sgst: totalSGST,
+      igst: totalIGST,
+      gst_type: gstType,
+      tax_mode: payload.taxMode,
+      round_off: roundOff,
+      customer_name: payload.customerName?.trim() || void 0,
+      customer_phone: payload.customerPhone?.trim() || void 0,
+      customer_gstin: payload.customerGstin?.trim().toUpperCase() || void 0,
+      total: roundedTotal,
+      payment_method: payload.paymentMethod,
+      status: "COMPLETED",
+      notes: payload.notes?.trim() || void 0,
+      created_at: now,
+      items: saleItems
+    };
+    if (isSupabaseConfigured) {
+      let saved;
+      try {
+        const [saleResult] = await Promise.all([
+          SupabaseDb.createSale(
+            { ...newSale, items: void 0 },
+            saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
+          ),
+          SupabaseDb.createStockMovementsBatch(stockMovements).catch((err) => {
+            console.error("Stock movements batch error:", err);
+          }),
+          Promise.all(
+            verifiedProducts.map(
+              (vp) => SupabaseDb.updateProduct(vp.product.id, {
+                current_stock: vp.product.current_stock,
+                updated_at: now
+              }).catch(() => {
+              })
+            )
+          )
+        ]);
+        saved = saleResult;
+      } catch (insertErr) {
+        const msg = String(insertErr?.message || "");
+        if (msg.includes("sales_bill_number_key") || msg.includes("unique constraint") || msg.includes("duplicate key")) {
+          console.warn("Bill number collision detected, generating next sequence and retrying...");
+          const retryBillNumber = await db.getNextBillNumberAsync(storeId);
+          newSale.bill_number = retryBillNumber;
+          saved = await SupabaseDb.createSale(
+            { ...newSale, items: void 0 },
+            saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
+          );
+        } else {
+          throw insertErr;
+        }
+      }
+      db.sales.unshift(saved);
+      db.sale_items.push(...saleItems);
+      db.stock_movements.unshift(...stockMovements);
+    } else {
+      const saved = await LocalDb.createSale(
+        { ...newSale, items: void 0 },
+        saleItems.map(({ id, sale_id, created_at, ...rest }) => rest)
+      );
+      await LocalDb.createStockMovementsBatch(stockMovements);
+      for (const vp of verifiedProducts) {
+        await LocalDb.updateProduct(vp.product.id, {
+          current_stock: vp.product.current_stock,
+          updated_at: now
+        });
+      }
+      db.sales.unshift(saved);
+      db.sale_items.push(...saleItems);
+      db.stock_movements.unshift(...stockMovements);
+    }
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "SALE_CREATED",
+      entityType: "SALE",
+      entityId: newSale.id,
+      afterData: { billNumber: newSale.bill_number, total: newSale.total, paymentMethod: newSale.payment_method, itemCount: saleItems.length }
+    });
+    if (newSale.payment_method === "CASH") {
+      await CashControlService.recordSaleIfSessionOpen(storeId, { ...newSale, items: saleItems }, userId, userName);
+    }
+    return { ...newSale, items: saleItems };
+  }
+  static async voidSale(params) {
+    const { storeId, userId, userName, saleId, reason } = params;
+    if (!reason || reason.trim().length === 0) throw new Error("A reason is mandatory for voiding a bill");
+    const sale = db.sales.find((s) => s.id === saleId && s.store_id === storeId);
+    if (!sale) throw new Error("Sale record not found");
+    if (sale.status === "VOIDED") throw new Error("This bill is already voided");
+    const saleItemsForSale = db.sale_items.filter((si) => si.sale_id === sale.id);
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const stockRestores = [];
+    for (const item of saleItemsForSale) {
+      const product = db.products.find((p) => p.id === item.product_id && p.store_id === storeId);
+      if (product) {
+        const beforeStock = product.current_stock;
+        const afterStock = beforeStock + item.quantity;
+        product.current_stock = afterStock;
+        product.updated_at = now;
+        stockRestores.push({ productId: product.id, newStock: afterStock });
+        const voidMov = {
+          store_id: storeId,
+          product_id: product.id,
+          product_name: product.name,
+          user_id: userId,
+          user_name: userName,
+          type: "VOID",
+          quantity: item.quantity,
+          before_stock: beforeStock,
+          after_stock: afterStock,
+          reason: `Stock restored from voided bill #${sale.bill_number}: ${reason.trim()}`,
+          reference_type: "SALE_VOID",
+          reference_id: sale.id
+        };
+        if (isSupabaseConfigured) {
+          SupabaseDb.createStockMovement(voidMov).catch(() => {
+          });
+          SupabaseDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {
+          });
+        } else {
+          LocalDb.createStockMovement(voidMov).catch(() => {
+          });
+          LocalDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {
+          });
+        }
+        db.stock_movements.unshift(voidMov);
+      }
+    }
+    sale.status = "VOIDED";
+    sale.voided_at = now;
+    sale.voided_by = userId;
+    sale.voided_by_name = userName;
+    sale.void_reason = reason.trim();
+    if (isSupabaseConfigured) {
+      await SupabaseDb.voidSale(saleId, userId, userName, reason.trim());
+    } else {
+      await LocalDb.voidSale(saleId, userId, userName, reason.trim());
+    }
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "SALE_VOIDED",
+      entityType: "SALE",
+      entityId: sale.id,
+      afterData: { billNumber: sale.bill_number, voidReason: sale.void_reason, voidedAt: sale.voided_at }
+    });
+    if (sale.payment_method === "CASH") {
+      await CashControlService.recordVoidIfSessionOpen(storeId, sale, userId, userName, reason.trim());
+    }
+    return sale;
+  }
+  static getSales(storeId, options) {
+    let list = db.sales.filter((s) => s.store_id === storeId);
+    if (options?.employeeId) list = list.filter((s) => s.employee_id === options.employeeId);
+    if (options?.paymentMethod) list = list.filter((s) => s.payment_method === options.paymentMethod);
+    if (options?.status) list = list.filter((s) => s.status === options.status);
+    if (options?.search) {
+      const q = options.search.trim().toLowerCase();
+      list = list.filter(
+        (s) => s.bill_number.toLowerCase().includes(q) || s.employee_name.toLowerCase().includes(q) || s.notes && s.notes.toLowerCase().includes(q)
+      );
+    }
+    if (options?.from) {
+      const fromDate = new Date(options.from).getTime();
+      list = list.filter((s) => new Date(s.created_at).getTime() >= fromDate);
+    }
+    if (options?.to) {
+      const toDate = new Date(options.to).getTime() + 864e5;
+      list = list.filter((s) => new Date(s.created_at).getTime() <= toDate);
+    }
+    const limit = options?.limit || 200;
+    return list.slice(0, limit).map((s) => ({
+      ...s,
+      items: db.sale_items.filter((si) => si.sale_id === s.id)
+    }));
+  }
+  static getSaleById(storeId, saleId) {
+    const sale = db.sales.find((s) => s.id === saleId && s.store_id === storeId);
+    if (!sale) throw new Error("Sale not found");
+    const items = db.sale_items.filter((si) => si.sale_id === sale.id);
+    return { ...sale, items };
   }
 };
 
@@ -4686,13 +5998,43 @@ var ReportService = class {
       }
     };
   }
-  static getEmployeeReport(storeId, options) {
-    const employees = db.users.filter((u) => u.store_id === storeId);
+  static async getEmployeeReport(storeId, options) {
+    let staffList = [];
+    try {
+      const cloudEmployees = await SupabaseDb.listEmployees(storeId).catch(() => []);
+      if (Array.isArray(cloudEmployees) && cloudEmployees.length > 0) {
+        staffList = cloudEmployees.map((u) => ({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role
+        }));
+      }
+    } catch (_) {
+    }
+    const localNonDevs = db.users.filter(
+      (u) => u.store_id === storeId && u.role !== "DEVELOPER" && (u.name || "").toLowerCase() !== "developer" && !(u.email || "").toLowerCase().includes("developer")
+    );
+    const knownIds = new Set(staffList.map((s) => s.id));
+    for (const u of localNonDevs) {
+      if (!knownIds.has(u.id)) {
+        staffList.push({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role
+        });
+        knownIds.add(u.id);
+      }
+    }
+    staffList = staffList.filter(
+      (u) => u.role !== "DEVELOPER" && (u.name || "").toLowerCase() !== "developer" && !(u.email || "").toLowerCase().includes("developer")
+    );
     let sales = db.sales.filter((s) => s.store_id === storeId && s.status === "COMPLETED");
     if (options?.from) sales = sales.filter((s) => s.created_at >= options.from);
     if (options?.to) sales = sales.filter((s) => s.created_at <= options.to + "T23:59:59.999Z");
     const empMap = /* @__PURE__ */ new Map();
-    employees.forEach((emp) => {
+    staffList.forEach((emp) => {
       empMap.set(emp.id, {
         employeeName: emp.name,
         email: emp.email,
@@ -4703,6 +6045,9 @@ var ReportService = class {
       });
     });
     sales.forEach((s) => {
+      if ((s.employee_name || "").toLowerCase() === "developer") {
+        return;
+      }
       const entry = empMap.get(s.employee_id);
       if (entry) {
         entry.billsCount += 1;
@@ -4723,7 +6068,7 @@ import { Router } from "express";
 import { z } from "zod";
 
 // server/services/inventoryLedgerEngine.ts
-import crypto10 from "node:crypto";
+import crypto11 from "node:crypto";
 
 // src/shared/calculations.ts
 function calculatePackBreakdown(stockBase, packSizeBase) {
@@ -5073,11 +6418,11 @@ var InventoryLedgerEngine = class {
     const unitCount = this.db.prepare("SELECT COUNT(*) as count FROM units").get()?.count || 0;
     if (unitCount === 0) {
       const defaultUnits = [
-        { id: crypto10.randomUUID(), code: "g", display_name: "Gram", dimension: "mass", base_unit_code: "g", conversion_factor: 1, precision_scale: 0 },
-        { id: crypto10.randomUUID(), code: "kg", display_name: "Kilogram", dimension: "mass", base_unit_code: "g", conversion_factor: 1e3, precision_scale: 3 },
-        { id: crypto10.randomUUID(), code: "ml", display_name: "Milliliter", dimension: "volume", base_unit_code: "ml", conversion_factor: 1, precision_scale: 0 },
-        { id: crypto10.randomUUID(), code: "l", display_name: "Liter", dimension: "volume", base_unit_code: "ml", conversion_factor: 1e3, precision_scale: 3 },
-        { id: crypto10.randomUUID(), code: "piece", display_name: "Piece", dimension: "count", base_unit_code: "piece", conversion_factor: 1, precision_scale: 0 }
+        { id: crypto11.randomUUID(), code: "g", display_name: "Gram", dimension: "mass", base_unit_code: "g", conversion_factor: 1, precision_scale: 0 },
+        { id: crypto11.randomUUID(), code: "kg", display_name: "Kilogram", dimension: "mass", base_unit_code: "g", conversion_factor: 1e3, precision_scale: 3 },
+        { id: crypto11.randomUUID(), code: "ml", display_name: "Milliliter", dimension: "volume", base_unit_code: "ml", conversion_factor: 1, precision_scale: 0 },
+        { id: crypto11.randomUUID(), code: "l", display_name: "Liter", dimension: "volume", base_unit_code: "ml", conversion_factor: 1e3, precision_scale: 3 },
+        { id: crypto11.randomUUID(), code: "piece", display_name: "Piece", dimension: "count", base_unit_code: "piece", conversion_factor: 1, precision_scale: 0 }
       ];
       const stmt = this.db.prepare(`
         INSERT INTO units (id, code, display_name, dimension, base_unit_code, conversion_factor, precision_scale, is_active)
@@ -5121,7 +6466,7 @@ var InventoryLedgerEngine = class {
         }
       } catch (_) {
       }
-      const smId = crypto10.randomUUID();
+      const smId = crypto11.randomUUID();
       this.db.prepare(`
         INSERT INTO stock_movements (
           id, store_id, product_id, product_name, user_id, user_name,
@@ -5173,7 +6518,7 @@ var InventoryLedgerEngine = class {
   // MASTER INVENTORY & UNIT SYSTEM
   // ============================================================
   createInventoryItem(params) {
-    const id = crypto10.randomUUID();
+    const id = crypto11.randomUUID();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     const sku = params.sku || null;
     const baseUnitCode = params.baseUnitCode || "g";
@@ -5215,7 +6560,7 @@ var InventoryLedgerEngine = class {
             reference_type, reference_id, reason, created_at, created_by
           ) VALUES (?, ?, 'opening_balance', ?, ?, ?, ?, 'setup', NULL, 'Initial stock setup', ?, 'SYSTEM')
         `).run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           id,
           initialStockBase,
           initialStockBase,
@@ -5242,7 +6587,7 @@ var InventoryLedgerEngine = class {
   // PRODUCTS, BOM RECIPES & MODIFIERS
   // ============================================================
   createProduct(params) {
-    const id = crypto10.randomUUID();
+    const id = crypto11.randomUUID();
     const now = (/* @__PURE__ */ new Date()).toISOString();
     this.db.prepare(`
       INSERT INTO bom_products (
@@ -5277,7 +6622,7 @@ var InventoryLedgerEngine = class {
         SELECT MAX(version_number) as maxVer FROM recipe_versions WHERE product_id = ?
       `).get(params.productId);
       const nextVer = (maxVerRow?.maxVer || 0) + 1;
-      const recipeId = crypto10.randomUUID();
+      const recipeId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       this.db.prepare(`
         INSERT INTO recipe_versions (
@@ -5301,7 +6646,7 @@ var InventoryLedgerEngine = class {
       `);
       for (const ing of params.ingredients) {
         insertIng.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           recipeId,
           ing.inventoryItemId,
           Math.max(1, Math.round(ing.quantityPerServingBase)),
@@ -5323,7 +6668,7 @@ var InventoryLedgerEngine = class {
     return { ...ver, ingredients };
   }
   createModifierGroup(params) {
-    const id = crypto10.randomUUID();
+    const id = crypto11.randomUUID();
     this.db.prepare(`
       INSERT INTO modifier_groups (
         id, name, selection_type, min_selections, max_selections, is_required, is_active
@@ -5339,7 +6684,7 @@ var InventoryLedgerEngine = class {
     return this.db.prepare("SELECT * FROM modifier_groups WHERE id = ?").get(id);
   }
   createModifier(params) {
-    const id = crypto10.randomUUID();
+    const id = crypto11.randomUUID();
     return this.runTransaction(() => {
       this.db.prepare(`
         INSERT INTO modifiers (
@@ -5354,7 +6699,7 @@ var InventoryLedgerEngine = class {
         `);
         for (const ing of params.ingredients) {
           stmt.run(
-            crypto10.randomUUID(),
+            crypto11.randomUUID(),
             id,
             ing.inventoryItemId,
             Math.max(1, Math.round(ing.quantityPerModifierBase))
@@ -5505,7 +6850,7 @@ var InventoryLedgerEngine = class {
       `).get(`FB-${todayStr}-%`);
       const seq = String((countTodayRow?.cnt || 0) + 1).padStart(4, "0");
       const billNumber = `FB-${todayStr}-${seq}`;
-      const saleId = crypto10.randomUUID();
+      const saleId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       const amountPaidMinor = checkoutData.amountPaidMinor !== void 0 ? checkoutData.amountPaidMinor : calculatedGrandTotal;
       const changeDueMinor = Math.max(0, amountPaidMinor - calculatedGrandTotal);
@@ -5545,7 +6890,7 @@ var InventoryLedgerEngine = class {
         ) VALUES (?, ?, ?, ?, ?, ?, ?)
       `);
       for (const item of processedItems) {
-        const saleItemId = crypto10.randomUUID();
+        const saleItemId = crypto11.randomUUID();
         insertItemStmt.run(
           saleItemId,
           saleId,
@@ -5565,7 +6910,7 @@ var InventoryLedgerEngine = class {
         );
         for (const mod of item.modifiers) {
           insertModStmt.run(
-            crypto10.randomUUID(),
+            crypto11.randomUUID(),
             saleItemId,
             mod.modifierId,
             mod.name,
@@ -5580,7 +6925,7 @@ var InventoryLedgerEngine = class {
           id, sale_id, payment_method, amount_minor, status, reference, created_at
         ) VALUES (?, ?, ?, ?, 'completed', NULL, ?)
       `).run(
-        crypto10.randomUUID(),
+        crypto11.randomUUID(),
         saleId,
         checkoutData.paymentMethod || "cash",
         amountPaidMinor,
@@ -5603,7 +6948,7 @@ var InventoryLedgerEngine = class {
         const resultingStock = item.current_stock_base - consumedQty;
         const totalCostMinor = Math.round(consumedQty * item.weighted_average_unit_cost_minor);
         insertMovement.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           item.id,
           -consumedQty,
           // Negative for consumption
@@ -5637,7 +6982,7 @@ var InventoryLedgerEngine = class {
       `).get(`PO-${todayStr}-%`);
       const seq = String((countTodayRow?.cnt || 0) + 1).padStart(3, "0");
       const purchaseNumber = purchaseData.purchaseNumber || `PO-${todayStr}-${seq}`;
-      const purchaseId = crypto10.randomUUID();
+      const purchaseId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       let subtotalMinor = 0;
       for (const l of purchaseData.lines) {
@@ -5708,7 +7053,7 @@ var InventoryLedgerEngine = class {
           receivedUnitCostMinor
         );
         const newStock = item.current_stock_base + baseQtyReceived;
-        const purchaseLineId = crypto10.randomUUID();
+        const purchaseLineId = crypto11.randomUUID();
         insertLine.run(
           purchaseLineId,
           purchaseId,
@@ -5722,7 +7067,7 @@ var InventoryLedgerEngine = class {
         );
         const lotCode = `LOT-${purchaseNumber}-${item.sku || item.id.slice(0, 6)}`;
         insertLot.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           item.id,
           lotCode,
           purchaseData.supplierId || null,
@@ -5734,7 +7079,7 @@ var InventoryLedgerEngine = class {
           now
         );
         insertMovement.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           item.id,
           baseQtyReceived,
           newStock,
@@ -5780,7 +7125,7 @@ var InventoryLedgerEngine = class {
       `).get(`SC-${todayStr}-%`);
       const seq = String((cntRow?.cnt || 0) + 1).padStart(3, "0");
       const countNumber = `SC-${todayStr}-${seq}`;
-      const countId = crypto10.randomUUID();
+      const countId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       this.db.prepare(`
         INSERT INTO stock_counts (id, count_number, status, count_date, notes, created_at)
@@ -5800,7 +7145,7 @@ var InventoryLedgerEngine = class {
         const varianceQty = counted - expected;
         const varianceCostMinor = Math.round(varianceQty * item.weighted_average_unit_cost_minor);
         insertLine.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           countId,
           item.id,
           expected,
@@ -5841,7 +7186,7 @@ var InventoryLedgerEngine = class {
         if (delta !== 0) {
           const totalCostMinor = Math.round(Math.abs(delta) * item.weighted_average_unit_cost_minor);
           insertMovement.run(
-            crypto10.randomUUID(),
+            crypto11.randomUUID(),
             item.id,
             delta,
             line.counted_quantity_base,
@@ -5888,7 +7233,7 @@ var InventoryLedgerEngine = class {
       const qty = Math.max(1, Math.round(data.quantityBase));
       const newStock = item.current_stock_base - qty;
       const totalCostMinor = Math.round(qty * item.weighted_average_unit_cost_minor);
-      const wastageId = crypto10.randomUUID();
+      const wastageId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       this.db.prepare(`
         INSERT INTO wastage_records (
@@ -5913,7 +7258,7 @@ var InventoryLedgerEngine = class {
           reference_type, reference_id, reason, created_at, created_by
         ) VALUES (?, ?, 'wastage', ?, ?, ?, ?, 'wastage', ?, ?, ?, ?)
       `).run(
-        crypto10.randomUUID(),
+        crypto11.randomUUID(),
         item.id,
         -qty,
         newStock,
@@ -5956,7 +7301,7 @@ var InventoryLedgerEngine = class {
       `).get(`REF-${todayStr}-%`);
       const seq = String((cntRow?.cnt || 0) + 1).padStart(3, "0");
       const refundNumber = `REF-${todayStr}-${seq}`;
-      const refundId = crypto10.randomUUID();
+      const refundId = crypto11.randomUUID();
       const now = (/* @__PURE__ */ new Date()).toISOString();
       this.db.prepare(`
         INSERT INTO pos_refunds (id, refund_number, sale_id, amount_minor, reason, status, created_at)
@@ -5979,7 +7324,7 @@ var InventoryLedgerEngine = class {
       `);
       for (const line of data.lines) {
         insertRefundLine.run(
-          crypto10.randomUUID(),
+          crypto11.randomUUID(),
           refundId,
           line.saleItemId,
           line.quantityRefunded,
@@ -6001,7 +7346,7 @@ var InventoryLedgerEngine = class {
                 const resultingStock = item.current_stock_base + deltaRestore;
                 const totalCostMinor = Math.round(deltaRestore * item.weighted_average_unit_cost_minor);
                 insertMovement.run(
-                  crypto10.randomUUID(),
+                  crypto11.randomUUID(),
                   item.id,
                   deltaRestore,
                   // Positive for restock
@@ -6710,6 +8055,68 @@ app.delete("/api/sales/purge-all", requireAuth, requireAdmin, async (req, res) =
     res.status(500).json({ error: { message: err.message } });
   }
 });
+app.get("/api/customers/lookup", async (req, res) => {
+  try {
+    const phone = (req.query.phone || "").trim();
+    if (!phone || phone.length < 4) {
+      return res.json({ found: false });
+    }
+    const token = req.cookies?.session_token || req.headers["x-session-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "") || req.query?.token;
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const customer = await LocalDb.getCustomerByPhone(storeId, phone);
+    return res.json({
+      found: Boolean(customer),
+      customer: customer || void 0
+    });
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/customers/search", async (req, res) => {
+  try {
+    const q = (req.query.q || req.query.query || "").trim();
+    const limit = req.query.limit ? Math.min(Number(req.query.limit), 50) : 8;
+    const token = req.cookies?.session_token || req.headers["x-session-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "") || req.query?.token;
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const suggestions = await LocalDb.searchCustomers(storeId, q, limit);
+    res.json(suggestions);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/customers/analytics", requireAuth, async (req, res) => {
+  try {
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const analytics = await LocalDb.getCustomerAnalytics(storeId);
+    res.json(analytics);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/customers/:phone/history", requireAuth, async (req, res) => {
+  try {
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const phone = req.params.phone;
+    const history = await LocalDb.getCustomerHistory(storeId, phone);
+    res.json(history);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
 app.get("/api/employees", requireAuth, requireAdmin, async (req, res) => {
   try {
     const employees = await EmployeeService.listEmployees(req.user.store_id, req.user.role);
@@ -6773,6 +8180,109 @@ app.delete("/api/employees/:id", requireAuth, requireAdmin, async (req, res) => 
     res.json(result);
   } catch (err) {
     res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/employees/:id/permissions", requireAuth, async (req, res) => {
+  try {
+    const permissions = await EmployeeService.getEmployeePermissions(req.user.store_id, req.params.id);
+    res.json({ userId: req.params.id, permissions });
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.put("/api/employees/:id/permissions", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const { permissions } = req.body;
+    const result = await EmployeeService.updateEmployeePermissions(
+      req.user.store_id,
+      req.user.id,
+      req.user.name,
+      req.params.id,
+      permissions
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/cash-control/current", requireAuth, async (req, res) => {
+  try {
+    const data = await CashControlService.getCurrentSession(req.user.store_id);
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/cash-control/open", requireAuth, async (req, res) => {
+  try {
+    const result = await CashControlService.openSession(
+      req.user.store_id,
+      req.user.id,
+      req.user.name,
+      req.body
+    );
+    res.status(201).json(result);
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/cash-control/cash-in", requireAuth, async (req, res) => {
+  try {
+    const result = await CashControlService.addCashIn(
+      req.user.store_id,
+      req.user.id,
+      req.user.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/cash-control/cash-out", requireAuth, async (req, res) => {
+  try {
+    const result = await CashControlService.addCashOut(
+      req.user.store_id,
+      req.user.id,
+      req.user.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/cash-control/close", requireAuth, async (req, res) => {
+  try {
+    const result = await CashControlService.closeSession(
+      req.user.store_id,
+      req.user.id,
+      req.user.name,
+      req.body
+    );
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/cash-control/sessions", requireAuth, async (req, res) => {
+  try {
+    const limit = Number(req.query.limit) || 50;
+    const list = await CashControlService.listSessions(req.user.store_id, limit);
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/cash-control/sessions/:id", requireAuth, async (req, res) => {
+  try {
+    const data = await CashControlService.getSessionDetails(req.user.store_id, req.params.id);
+    if (!data.session) {
+      return res.status(404).json({ error: { message: "Cash drawer session not found" } });
+    }
+    res.json(data);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 app.get("/api/expenses", requireAuth, requireAdmin, (req, res) => {
@@ -6840,9 +8350,9 @@ app.get("/api/reports/profit", requireAuth, requireAdmin, (req, res) => {
   });
   res.json(rep);
 });
-app.get("/api/reports/employees", requireAuth, requireAdmin, (req, res) => {
+app.get("/api/reports/employees", requireAuth, requireAdmin, async (req, res) => {
   const { from, to } = req.query;
-  const rep = ReportService.getEmployeeReport(req.user.store_id, {
+  const rep = await ReportService.getEmployeeReport(req.user.store_id, {
     from,
     to
   });
@@ -6903,6 +8413,40 @@ app.patch("/api/settings", requireAuth, requireAdmin, async (req, res) => {
     res.json(store);
   } catch (err) {
     res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/settings/printer", async (req, res) => {
+  try {
+    const token = req.cookies?.session_token || req.headers["x-session-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "") || req.query?.token;
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const settings = await LocalDb.getPrinterSettings(storeId);
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/settings/printer", async (req, res) => {
+  try {
+    const token = req.cookies?.session_token || req.headers["x-session-token"] || req.headers["authorization"]?.replace(/^Bearer\s+/i, "") || req.query?.token;
+    if (token) {
+      const sessionData = AuthService.getSession(token);
+      if (sessionData) {
+        req.user = sessionData.user;
+        req.store = sessionData.store;
+      }
+    }
+    const storeId = req.user?.store_id || LocalDb.resolveValidStoreId();
+    const saved = await LocalDb.savePrinterSettings(storeId, req.body);
+    res.json({ success: true, settings: saved });
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 app.get("/api/system/printers", (_req, res) => {
@@ -7075,6 +8619,15 @@ SUPABASE_SERVICE_ROLE_KEY="${supabaseServiceKey.trim()}"`;
       await LocalDb.setDeveloperConfig("PORT", String(port));
     }
     fs3.writeFileSync(envPath, currentEnv, "utf8");
+    if (process.env.DATA_DIR) {
+      try {
+        const persistentEnvPath = path3.join(process.env.DATA_DIR, ".env");
+        if (persistentEnvPath !== envPath) {
+          fs3.writeFileSync(persistentEnvPath, currentEnv, "utf8");
+        }
+      } catch (_) {
+      }
+    }
     AuditService.log({
       storeId: req.user.store_id,
       userId: req.user.id,
@@ -7128,6 +8681,43 @@ app.post("/api/developer/test-connection", requireAuth, requireDeveloper, async 
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message || "Connection test failed" });
+  }
+});
+app.get("/api/developer/cloud-stores", requireAuth, requireDeveloper, async (_req, res) => {
+  try {
+    const stores = await SupabaseDb.listStoresFromCloud();
+    res.json({ stores });
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/developer/cloud-stores/toggle", requireAuth, requireDeveloper, async (req, res) => {
+  try {
+    const { storeIdOrName, active } = req.body;
+    if (!storeIdOrName) {
+      return res.status(400).json({ error: { message: "storeIdOrName is required" } });
+    }
+    const newStatus = active ? "ACTIVE" : "STOPPED";
+    const updated = await SupabaseDb.updateStoreInCloud(storeIdOrName, {
+      active: Boolean(active),
+      status: newStatus,
+      is_blocked: !active
+    });
+    AuditService.log({
+      storeId: "global",
+      userId: req.user.id,
+      userName: req.user.name,
+      action: active ? "STORE_ACTIVATED" : "STORE_STOPPED",
+      entityType: "STORE",
+      afterData: { storeIdOrName, status: newStatus }
+    });
+    res.json({
+      success: true,
+      updated,
+      message: `Store "${storeIdOrName}" is now ${newStatus}. ${active ? "Users can log in." : "Users are now blocked from logging in."}`
+    });
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 app.use((err, _req, res, _next) => {

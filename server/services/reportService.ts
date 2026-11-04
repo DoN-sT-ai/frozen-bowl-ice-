@@ -1,4 +1,5 @@
 import { db } from '../db.ts';
+import { SupabaseDb } from '../supabaseDb.ts';
 
 function round2(num: number): number {
   return Math.round((num + Number.EPSILON) * 100) / 100;
@@ -146,8 +147,50 @@ export class ReportService {
     };
   }
 
-  static getEmployeeReport(storeId: string, options?: { from?: string; to?: string }) {
-    const employees = db.users.filter(u => u.store_id === storeId);
+  static async getEmployeeReport(storeId: string, options?: { from?: string; to?: string }) {
+    let staffList: Array<{ id: string; name: string; email: string; role: string }> = [];
+
+    // 1. Fetch cloud employees if Supabase is connected
+    try {
+      const cloudEmployees = await SupabaseDb.listEmployees(storeId).catch(() => []);
+      if (Array.isArray(cloudEmployees) && cloudEmployees.length > 0) {
+        staffList = cloudEmployees.map(u => ({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+        }));
+      }
+    } catch (_) {}
+
+    // 2. Merge local non-developer users
+    const localNonDevs = db.users.filter(u =>
+      u.store_id === storeId &&
+      u.role !== 'DEVELOPER' &&
+      (u.name || '').toLowerCase() !== 'developer' &&
+      !(u.email || '').toLowerCase().includes('developer')
+    );
+
+    const knownIds = new Set(staffList.map(s => s.id));
+    for (const u of localNonDevs) {
+      if (!knownIds.has(u.id)) {
+        staffList.push({
+          id: u.id,
+          name: u.name,
+          email: u.email,
+          role: u.role,
+        });
+        knownIds.add(u.id);
+      }
+    }
+
+    // 3. Strict guard: Developer must never appear in staff performance
+    staffList = staffList.filter(u =>
+      u.role !== 'DEVELOPER' &&
+      (u.name || '').toLowerCase() !== 'developer' &&
+      !(u.email || '').toLowerCase().includes('developer')
+    );
+
     let sales = db.sales.filter(s => s.store_id === storeId && s.status === 'COMPLETED');
 
     if (options?.from) sales = sales.filter(s => s.created_at >= options.from!);
@@ -155,7 +198,7 @@ export class ReportService {
 
     const empMap = new Map<string, { employeeName: string; email: string; role: string; billsCount: number; totalSales: number; itemsSold: number }>();
 
-    employees.forEach(emp => {
+    staffList.forEach(emp => {
       empMap.set(emp.id, {
         employeeName: emp.name,
         email: emp.email,
@@ -167,6 +210,11 @@ export class ReportService {
     });
 
     sales.forEach(s => {
+      // Exclude developer billed sales from staff performance table
+      if ((s.employee_name || '').toLowerCase() === 'developer') {
+        return;
+      }
+
       const entry = empMap.get(s.employee_id);
       if (entry) {
         entry.billsCount += 1;

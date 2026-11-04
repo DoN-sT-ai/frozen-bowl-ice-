@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Product, CartItem, Sale, SelectedModifier } from '../../types';
+import { Product, CartItem, Sale, SelectedModifier, CustomerSuggestion } from '../../types';
 import { api } from '../../lib/api';
 import { formatCurrency, formatBillNumber } from '../../lib/utils';
 import { ModifierModal } from './ModifierModal';
@@ -7,7 +7,7 @@ import { playScannerBeep } from '../../lib/barcodeUtils';
 import { useAuth } from '../../context/AuthContext';
 import { ThermalReceiptContent } from './ThermalReceiptContent';
 import { ReceiptModal } from './ReceiptModal';
-import { printReceipt } from '../../lib/printerService';
+import { printReceipt, getPrinterSettings, savePrinterSettings, PrinterCustomizationSettings } from '../../lib/printerService';
 import {
   Search,
   Plus,
@@ -29,6 +29,8 @@ import {
   Eye,
   X,
   Loader2,
+  User,
+  Phone,
 } from 'lucide-react';
 
 interface POSWorkspaceProps {
@@ -65,6 +67,31 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   const [customerPhone, setCustomerPhone] = useState<string>('');
   const [customerGstin, setCustomerGstin] = useState<string>('');
 
+  // Customer Prompt on Billing Modal State
+  const [showCustomerPromptModal, setShowCustomerPromptModal] = useState<boolean>(false);
+  const showCustomerPromptModalRef = useRef<boolean>(false);
+  showCustomerPromptModalRef.current = showCustomerPromptModal;
+  const [promptCustomerPhone, setPromptCustomerPhone] = useState<string>('');
+  const [promptCustomerName, setPromptCustomerName] = useState<string>('');
+  const [promptCustomerGstin, setPromptCustomerGstin] = useState<string>('');
+  const [isLookingUpCustomer, setIsLookingUpCustomer] = useState<boolean>(false);
+  const [customerLookupFound, setCustomerLookupFound] = useState<boolean>(false);
+  const [pendingForcePrint, setPendingForcePrint] = useState<boolean>(false);
+  const promptPhoneInputRef = useRef<HTMLInputElement>(null);
+  const promptNameInputRef = useRef<HTMLInputElement>(null);
+
+  // Customer phone suggestion states (Sidebar)
+  const [sidebarSuggestions, setSidebarSuggestions] = useState<CustomerSuggestion[]>([]);
+  const [showSidebarSuggestions, setShowSidebarSuggestions] = useState<boolean>(false);
+  const [sidebarSuggestionIndex, setSidebarSuggestionIndex] = useState<number>(-1);
+  const sidebarPhoneTimeoutRef = useRef<any>(null);
+
+  // Customer phone suggestion states (Prompt modal)
+  const [promptSuggestions, setPromptSuggestions] = useState<CustomerSuggestion[]>([]);
+  const [showPromptSuggestions, setShowPromptSuggestions] = useState<boolean>(false);
+  const [promptSuggestionIndex, setPromptSuggestionIndex] = useState<number>(-1);
+  const promptPhoneTimeoutRef = useRef<any>(null);
+
   // Submission, Auto-Print & Feedback
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -77,10 +104,21 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
     paymentMethod: string;
   } | null>(null);
 
-  // Auto-Print Toggle (persisted in localStorage)
+  // Printer Hardware & Customization State
+  const [printerSettings, setPrinterSettings] = useState<PrinterCustomizationSettings>(() => getPrinterSettings());
   const [autoPrintEnabled, setAutoPrintEnabled] = useState<boolean>(() => {
-    return localStorage.getItem('pos_auto_print') === 'true';
+    return getPrinterSettings().autoPrintOnSale;
   });
+
+  useEffect(() => {
+    const handlePrinterSettingsChange = (e: any) => {
+      const updated = e.detail || getPrinterSettings();
+      setPrinterSettings(updated);
+      setAutoPrintEnabled(updated.autoPrintOnSale);
+    };
+    window.addEventListener('pos_printer_settings_changed', handlePrinterSettingsChange);
+    return () => window.removeEventListener('pos_printer_settings_changed', handlePrinterSettingsChange);
+  }, []);
   const [showAllCatalog, setShowAllCatalog] = useState<boolean>(false);
 
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -131,6 +169,7 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
 
   // Callable ref bridges to avoid stale closures in event listeners
   const handleCompleteBillRef = useRef<(forcePrint?: boolean) => Promise<void>>(() => Promise.resolve());
+  const requestCompleteBillRef = useRef<(forcePrint?: boolean) => void>(() => {});
   const triggerQuickPrintStepRef = useRef<() => void>(() => {});
   const addToCartRef = useRef<(product: Product, quantity?: number, selectedModifiers?: SelectedModifier[]) => void>(() => {});
   const filteredProductsRef = useRef<Product[]>([]);
@@ -140,7 +179,7 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   const toggleAutoPrint = () => {
     setAutoPrintEnabled((prev) => {
       const next = !prev;
-      localStorage.setItem('pos_auto_print', String(next));
+      savePrinterSettings({ autoPrintOnSale: next });
       return next;
     });
   };
@@ -428,14 +467,15 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
 
   // Direct Silent Print to connected hardware printer (no preview tabs, no dialogs)
   const triggerAutoPrint = (saleToPrint: Sale) => {
+    const settings = getPrinterSettings();
     printReceipt({
       sale: saleToPrint,
       store: storeRef.current,
-      format: (localStorage.getItem('pos_paper_size') as any) || '80mm',
+      format: settings.format,
       docType: 'BILL',
       qrCodeDataUrl: autoPrintQrRef.current || undefined,
-      silent: localStorage.getItem('pos_direct_print') !== 'false',
-      deviceName: localStorage.getItem('pos_printer_name') || '',
+      silent: settings.directPrint,
+      deviceName: settings.deviceName,
     });
   };
 
@@ -508,9 +548,13 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
       // Reset checkout form immediately
       clearCart();
       setCustomerName('');
+      customerNameRef.current = '';
       setCustomerPhone('');
+      customerPhoneRef.current = '';
       setCustomerGstin('');
+      customerGstinRef.current = '';
       setCustomerNotes('');
+      customerNotesRef.current = '';
       setCashTendered('');
       setDiscount(0);
       setMobileTab('catalog');
@@ -539,6 +583,179 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   };
   handleCompleteBillRef.current = handleCompleteBill;
 
+  // Phone input with fast autocomplete suggestions in sidebar
+  const handleCustomerPhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    const digits = raw.replace(/\D/g, '').slice(0, 10);
+    setCustomerPhone(digits);
+    customerPhoneRef.current = digits;
+    setSidebarSuggestionIndex(-1);
+
+    if (sidebarPhoneTimeoutRef.current) {
+      clearTimeout(sidebarPhoneTimeoutRef.current);
+    }
+
+    if (digits.length >= 2) {
+      sidebarPhoneTimeoutRef.current = setTimeout(async () => {
+        try {
+          const suggestions = await api.searchCustomers(digits, 6);
+          setSidebarSuggestions(suggestions);
+          setShowSidebarSuggestions(suggestions.length > 0);
+        } catch (err) {
+          console.error('Customer search error', err);
+        }
+      }, 80);
+    } else {
+      setSidebarSuggestions([]);
+      setShowSidebarSuggestions(false);
+    }
+
+    if (digits.length === 10) {
+      api.lookupCustomer(digits).then(res => {
+        if (res.found && res.customer?.customer_name) {
+          setCustomerName(res.customer.customer_name);
+          customerNameRef.current = res.customer.customer_name;
+          if (res.customer.customer_gstin) {
+            setCustomerGstin(res.customer.customer_gstin);
+            customerGstinRef.current = res.customer.customer_gstin;
+            setShowCustomerDetails(true);
+          }
+        }
+      }).catch(err => console.error('Customer lookup error', err));
+    }
+  };
+
+  const handleSelectSidebarCustomer = (cust: CustomerSuggestion) => {
+    setCustomerPhone(cust.customer_phone);
+    customerPhoneRef.current = cust.customer_phone;
+    setCustomerName(cust.customer_name);
+    customerNameRef.current = cust.customer_name;
+    if (cust.customer_gstin) {
+      setCustomerGstin(cust.customer_gstin);
+      customerGstinRef.current = cust.customer_gstin;
+      setShowCustomerDetails(true);
+    }
+    setShowSidebarSuggestions(false);
+    setSidebarSuggestions([]);
+  };
+
+  // Phone input with fast autocomplete suggestions in customer prompt modal
+  const handlePromptPhoneChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const raw = e.target.value;
+    const digits = raw.replace(/\D/g, '').slice(0, 10);
+    setPromptCustomerPhone(digits);
+    setPromptSuggestionIndex(-1);
+
+    if (promptPhoneTimeoutRef.current) {
+      clearTimeout(promptPhoneTimeoutRef.current);
+    }
+
+    if (digits.length >= 2) {
+      promptPhoneTimeoutRef.current = setTimeout(async () => {
+        try {
+          const suggestions = await api.searchCustomers(digits, 6);
+          setPromptSuggestions(suggestions);
+          setShowPromptSuggestions(suggestions.length > 0);
+        } catch (err) {
+          console.error('Prompt customer search error', err);
+        }
+      }, 80);
+    } else {
+      setPromptSuggestions([]);
+      setShowPromptSuggestions(false);
+    }
+
+    if (digits.length === 10) {
+      setIsLookingUpCustomer(true);
+      api.lookupCustomer(digits).then(res => {
+        if (res.found && res.customer?.customer_name) {
+          setPromptCustomerName(res.customer.customer_name);
+          if (res.customer.customer_gstin) {
+            setPromptCustomerGstin(res.customer.customer_gstin);
+          }
+          setCustomerLookupFound(true);
+        } else {
+          setCustomerLookupFound(false);
+        }
+      }).catch(err => console.error('Customer prompt lookup error', err))
+        .finally(() => setIsLookingUpCustomer(false));
+    } else {
+      setCustomerLookupFound(false);
+    }
+  };
+
+  const handleSelectPromptCustomer = (cust: CustomerSuggestion) => {
+    setPromptCustomerPhone(cust.customer_phone);
+    setPromptCustomerName(cust.customer_name);
+    if (cust.customer_gstin) {
+      setPromptCustomerGstin(cust.customer_gstin);
+    }
+    setCustomerLookupFound(true);
+    setShowPromptSuggestions(false);
+    setPromptSuggestions([]);
+    promptNameInputRef.current?.focus();
+  };
+
+  const handleCustomerPromptSubmit = () => {
+    const trimmedPhone = promptCustomerPhone.trim();
+    const trimmedName = promptCustomerName.trim();
+    const trimmedGstin = promptCustomerGstin.trim().toUpperCase();
+
+    if (trimmedPhone) {
+      setCustomerPhone(trimmedPhone);
+      customerPhoneRef.current = trimmedPhone;
+    }
+    if (trimmedName) {
+      setCustomerName(trimmedName);
+      customerNameRef.current = trimmedName;
+    }
+    if (trimmedGstin) {
+      setCustomerGstin(trimmedGstin);
+      customerGstinRef.current = trimmedGstin;
+    }
+
+    setShowCustomerPromptModal(false);
+    handleCompleteBill(pendingForcePrint);
+  };
+
+  const handleCustomerPromptSkip = () => {
+    setShowCustomerPromptModal(false);
+    handleCompleteBill(pendingForcePrint);
+  };
+
+  const requestCompleteBill = (forcePrint = false) => {
+    if (cartRef.current.length === 0 || isSubmittingRef.current) {
+      if (cartRef.current.length === 0) {
+        setErrorMessage('Cart is empty. Scan or add an item first.');
+      }
+      return;
+    }
+
+    // If customer details are already provided in the sidebar, checkout directly
+    if (customerPhoneRef.current.trim() || customerNameRef.current.trim()) {
+      handleCompleteBill(forcePrint);
+      return;
+    }
+
+    // Otherwise, ask for customer mobile number and name
+    setPendingForcePrint(forcePrint);
+    setPromptCustomerPhone('');
+    setPromptCustomerName('');
+    setPromptCustomerGstin('');
+    setCustomerLookupFound(false);
+    setShowCustomerPromptModal(true);
+  };
+  requestCompleteBillRef.current = requestCompleteBill;
+
+  useEffect(() => {
+    if (showCustomerPromptModal) {
+      const timer = setTimeout(() => {
+        promptPhoneInputRef.current?.focus();
+      }, 60);
+      return () => clearTimeout(timer);
+    }
+  }, [showCustomerPromptModal]);
+
   // Step handler for keyboard double-Enter quick checkout & print
   const triggerQuickPrintStep = () => {
     if (cartRef.current.length === 0 || isSubmittingRef.current) {
@@ -556,7 +773,7 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
       }
       setConfirmPrintPrompt(false);
       confirmPrintPromptRef.current = false;
-      handleCompleteBillRef.current(true); // forcePrint = true
+      requestCompleteBillRef.current(true); // forcePrint = true
     } else {
       // 1st Enter received! Activate confirmation stage
       setConfirmPrintPrompt(true);
@@ -581,6 +798,11 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   // Global POS Keyboard Navigation Listener
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      // If customer prompt modal is currently open, let it handle keyboard navigation
+      if (showCustomerPromptModalRef.current) {
+        return;
+      }
+
       // Ctrl+Enter or Cmd+Enter or F4: Instant complete bill & print
       if (((e.ctrlKey || e.metaKey) && e.key === 'Enter') || e.key === 'F4') {
         e.preventDefault();
@@ -588,7 +810,7 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
           if (confirmPrintTimerRef.current) clearTimeout(confirmPrintTimerRef.current);
           setConfirmPrintPrompt(false);
           confirmPrintPromptRef.current = false;
-          handleCompleteBillRef.current(true);
+          requestCompleteBillRef.current(true);
         }
         return;
       }
@@ -1339,17 +1561,136 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
 
         {/* Calculation & Payment Drawer */}
         <div className="p-3 border-t border-neutral-200 bg-neutral-50 space-y-3">
-          {/* GST Billing Mode Selector */}
-          <div className="space-y-1">
-            <div className="flex items-center justify-between text-[11px] text-neutral-600">
-              <span className="font-medium">GST Billing Mode:</span>
+          {/* Customer Details */}
+          <div className="p-2.5 bg-white rounded border border-neutral-200 space-y-2 text-xs">
+            <div className="flex items-center justify-between">
+              <span className="font-semibold text-neutral-800 text-[11px] uppercase tracking-wider flex items-center gap-1.5 font-mono">
+                <User className="w-3.5 h-3.5 text-neutral-500" />
+                Customer Info
+              </span>
               <button
                 type="button"
                 onClick={() => setShowCustomerDetails(!showCustomerDetails)}
-                className="text-[11px] text-neutral-800 hover:text-neutral-900 underline font-medium"
+                className="text-[10px] text-neutral-500 hover:text-neutral-900 underline font-mono"
               >
-                {showCustomerDetails ? 'Hide Customer/GSTIN' : '+ Customer / GSTIN (B2B)'}
+                {showCustomerDetails ? '− Hide B2B/GSTIN' : '+ B2B GSTIN'}
               </button>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              <div className="relative">
+                <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Mobile Number</label>
+                <input
+                  type="tel"
+                  maxLength={10}
+                  placeholder="10-digit mobile"
+                  value={customerPhone}
+                  onChange={handleCustomerPhoneChange}
+                  onFocus={() => {
+                    if (sidebarSuggestions.length > 0 && customerPhone.length >= 2) {
+                      setShowSidebarSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowSidebarSuggestions(false), 200);
+                  }}
+                  onKeyDown={(e) => {
+                    if (showSidebarSuggestions && sidebarSuggestions.length > 0) {
+                      if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        setSidebarSuggestionIndex(prev => (prev < sidebarSuggestions.length - 1 ? prev + 1 : 0));
+                      } else if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        setSidebarSuggestionIndex(prev => (prev > 0 ? prev - 1 : sidebarSuggestions.length - 1));
+                      } else if (e.key === 'Enter') {
+                        if (sidebarSuggestionIndex >= 0 && sidebarSuggestions[sidebarSuggestionIndex]) {
+                          e.preventDefault();
+                          handleSelectSidebarCustomer(sidebarSuggestions[sidebarSuggestionIndex]);
+                        } else if (sidebarSuggestions.length === 1 && customerPhone.length >= 3) {
+                          e.preventDefault();
+                          handleSelectSidebarCustomer(sidebarSuggestions[0]);
+                        }
+                      } else if (e.key === 'Escape') {
+                        setShowSidebarSuggestions(false);
+                      }
+                    }
+                  }}
+                  className="w-full px-2 py-1 text-xs font-mono border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none"
+                />
+
+                {/* Autocomplete suggestion dropdown */}
+                {showSidebarSuggestions && sidebarSuggestions.length > 0 && (
+                  <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white border border-neutral-300 rounded-md shadow-lg overflow-hidden max-h-48 overflow-y-auto">
+                    <div className="px-2 py-1 text-[9px] font-mono text-neutral-400 bg-neutral-50 border-b border-neutral-100 flex items-center justify-between">
+                      <span>EXISTING CUSTOMERS</span>
+                      <span>↑↓ Enter</span>
+                    </div>
+                    {sidebarSuggestions.map((item, idx) => (
+                      <div
+                        key={item.customer_phone}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          handleSelectSidebarCustomer(item);
+                        }}
+                        className={`px-2 py-1.5 flex items-center justify-between cursor-pointer border-b border-neutral-50 last:border-0 ${
+                          idx === sidebarSuggestionIndex ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100 text-neutral-900'
+                        }`}
+                      >
+                        <div className="truncate pr-1">
+                          <div className="font-mono font-semibold text-xs leading-tight">
+                            {item.customer_phone}
+                          </div>
+                          <div className={`text-[10px] truncate leading-tight ${idx === sidebarSuggestionIndex ? 'text-neutral-300' : 'text-neutral-600'}`}>
+                            {item.customer_name}
+                          </div>
+                        </div>
+                        <span className={`text-[9px] font-mono px-1 py-0.2 rounded shrink-0 ${
+                          idx === sidebarSuggestionIndex
+                            ? 'bg-neutral-800 text-neutral-200'
+                            : 'bg-neutral-100 text-neutral-600'
+                        }`}>
+                          {item.visit_count}v
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div>
+                <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Customer Name</label>
+                <input
+                  type="text"
+                  placeholder="Customer name"
+                  value={customerName}
+                  onChange={(e) => {
+                    setCustomerName(e.target.value);
+                    customerNameRef.current = e.target.value;
+                  }}
+                  className="w-full px-2 py-1 text-xs border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none"
+                />
+              </div>
+            </div>
+            {showCustomerDetails && (
+              <div className="pt-1.5 border-t border-dashed border-neutral-200">
+                <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Customer GSTIN (15 Digits)</label>
+                <input
+                  type="text"
+                  maxLength={15}
+                  placeholder="e.g. 29ABCDE1234F1Z5"
+                  value={customerGstin}
+                  onChange={(e) => {
+                    setCustomerGstin(e.target.value.toUpperCase());
+                    customerGstinRef.current = e.target.value.toUpperCase();
+                  }}
+                  className="w-full px-2 py-1 text-xs font-mono border border-neutral-300 rounded uppercase focus:border-neutral-900 focus:outline-none"
+                />
+              </div>
+            )}
+          </div>
+
+          {/* GST Billing Mode Selector */}
+          <div className="space-y-1">
+            <div className="text-[11px] text-neutral-600 font-medium">
+              GST Billing Mode:
             </div>
             <div className="grid grid-cols-3 gap-1 text-[11px]">
               <button
@@ -1387,48 +1728,6 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               </button>
             </div>
           </div>
-
-          {/* Customer / B2B GSTIN Collapsible Section */}
-          {showCustomerDetails && (
-            <div className="p-2.5 bg-white rounded border border-neutral-200 space-y-2 text-xs">
-              <div className="font-semibold text-neutral-800 text-[11px] uppercase tracking-wider font-mono">
-                B2B Customer & GSTIN Details
-              </div>
-              <div className="grid grid-cols-2 gap-2">
-                <div>
-                  <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Customer Name</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Rahul Sharma / ABC Traders"
-                    value={customerName}
-                    onChange={(e) => setCustomerName(e.target.value)}
-                    className="w-full px-2 py-1 text-xs border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none"
-                  />
-                </div>
-                <div>
-                  <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Phone Number</label>
-                  <input
-                    type="tel"
-                    placeholder="10-digit mobile"
-                    value={customerPhone}
-                    onChange={(e) => setCustomerPhone(e.target.value)}
-                    className="w-full px-2 py-1 text-xs font-mono border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none"
-                  />
-                </div>
-              </div>
-              <div>
-                <label className="text-[10px] text-neutral-500 font-medium block mb-0.5">Customer GSTIN (15 Digits)</label>
-                <input
-                  type="text"
-                  maxLength={15}
-                  placeholder="e.g. 29ABCDE1234F1Z5"
-                  value={customerGstin}
-                  onChange={(e) => setCustomerGstin(e.target.value.toUpperCase())}
-                  className="w-full px-2 py-1 text-xs font-mono border border-neutral-300 rounded uppercase focus:border-neutral-900 focus:outline-none"
-                />
-              </div>
-            </div>
-          )}
 
           {/* Subtotals & Taxes */}
           <div className="space-y-1 text-xs">
@@ -1632,15 +1931,17 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
             <div className="flex items-center gap-1.5 truncate">
               <Printer className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
               <span className="truncate font-medium text-neutral-700">
-                {localStorage.getItem('pos_printer_name') ? `Direct to: ${localStorage.getItem('pos_printer_name')}` : 'Direct Print (System Default)'}
+                {printerSettings.deviceName ? `Direct: ${printerSettings.deviceName}` : 'Thermal Direct (System Default)'}
               </span>
             </div>
-            <span className="text-[10px] text-neutral-400 font-mono shrink-0">Enter ↵ x2</span>
+            <span className="text-[10px] text-neutral-400 font-mono shrink-0">
+              {printerSettings.format === '58mm' ? '2" Thermal' : printerSettings.format === '80mm' ? '3" Thermal' : printerSettings.format.toUpperCase()} • Enter ↵ x2
+            </span>
           </div>
 
           {/* Action Button: Complete Bill / Double-Enter Direct Print */}
           <button
-            onClick={() => handleCompleteBill(confirmPrintPrompt)}
+            onClick={() => requestCompleteBill(confirmPrintPrompt)}
             disabled={cart.length === 0 || isSubmitting}
             className={`w-full py-3 rounded font-semibold text-sm flex items-center justify-center gap-2 transition-all ${
               cart.length === 0 || isSubmitting
@@ -1680,7 +1981,213 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
       </div>
       </div>
 
+      {/* Customer Information Prompt Modal on Checkout */}
+      {showCustomerPromptModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150"
+          onKeyDown={(e) => {
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              handleCustomerPromptSkip();
+            }
+          }}
+        >
+          <div className="bg-white rounded-lg border border-neutral-200 shadow-2xl w-full max-w-md p-5 space-y-4">
+            <div className="flex items-start justify-between">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 rounded-full bg-neutral-100 flex items-center justify-center border border-neutral-200">
+                  <User className="w-5 h-5 text-neutral-800" />
+                </div>
+                <div>
+                  <h3 className="font-semibold text-neutral-900 text-sm">Customer Information</h3>
+                  <p className="text-xs text-neutral-500">Record customer mobile number & name on this bill</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCustomerPromptModal(false)}
+                className="text-neutral-400 hover:text-neutral-600 p-1 rounded-md transition-colors"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
 
+            <div className="space-y-3">
+              <div className="relative">
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-xs font-medium text-neutral-700 flex items-center gap-1.5">
+                    <Phone className="w-3.5 h-3.5 text-neutral-500" />
+                    Mobile Number
+                  </label>
+                  {isLookingUpCustomer && (
+                    <span className="text-[10px] text-neutral-400 flex items-center gap-1">
+                      <Loader2 className="w-3 h-3 animate-spin" /> Checking history...
+                    </span>
+                  )}
+                  {customerLookupFound && (
+                    <span className="text-[10px] font-medium text-emerald-700 bg-emerald-50 px-1.5 py-0.5 rounded border border-emerald-200">
+                      Returning Customer
+                    </span>
+                  )}
+                </div>
+                <input
+                  ref={promptPhoneInputRef}
+                  type="tel"
+                  maxLength={10}
+                  placeholder="Enter 10-digit mobile number"
+                  value={promptCustomerPhone}
+                  onChange={handlePromptPhoneChange}
+                  onFocus={() => {
+                    if (promptSuggestions.length > 0 && promptCustomerPhone.length >= 2) {
+                      setShowPromptSuggestions(true);
+                    }
+                  }}
+                  onBlur={() => {
+                    setTimeout(() => setShowPromptSuggestions(false), 200);
+                  }}
+                  onKeyDown={(e) => {
+                    if (showPromptSuggestions && promptSuggestions.length > 0) {
+                      if (e.key === 'ArrowDown') {
+                        e.preventDefault();
+                        setPromptSuggestionIndex(prev => (prev < promptSuggestions.length - 1 ? prev + 1 : 0));
+                        return;
+                      } else if (e.key === 'ArrowUp') {
+                        e.preventDefault();
+                        setPromptSuggestionIndex(prev => (prev > 0 ? prev - 1 : promptSuggestions.length - 1));
+                        return;
+                      } else if (e.key === 'Enter') {
+                        if (promptSuggestionIndex >= 0 && promptSuggestions[promptSuggestionIndex]) {
+                          e.preventDefault();
+                          handleSelectPromptCustomer(promptSuggestions[promptSuggestionIndex]);
+                          return;
+                        } else if (promptSuggestions.length === 1 && promptCustomerPhone.length >= 3) {
+                          e.preventDefault();
+                          handleSelectPromptCustomer(promptSuggestions[0]);
+                          return;
+                        }
+                      } else if (e.key === 'Escape') {
+                        setShowPromptSuggestions(false);
+                        return;
+                      }
+                    }
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      promptNameInputRef.current?.focus();
+                    }
+                  }}
+                  className="w-full px-3 py-2 text-sm font-mono border border-neutral-300 rounded focus:border-neutral-900 focus:ring-1 focus:ring-neutral-900 focus:outline-none"
+                  autoFocus
+                />
+
+                {/* Autocomplete suggestion dropdown for prompt modal */}
+                {showPromptSuggestions && promptSuggestions.length > 0 && (
+                  <div className="absolute left-0 right-0 top-full mt-1 z-50 bg-white border border-neutral-300 rounded-md shadow-lg overflow-hidden max-h-48 overflow-y-auto">
+                    <div className="px-2.5 py-1 text-[10px] font-mono text-neutral-400 bg-neutral-50 border-b border-neutral-100 flex items-center justify-between">
+                      <span>MATCHING CUSTOMERS</span>
+                      <span>↑↓ Navigate • Enter</span>
+                    </div>
+                    {promptSuggestions.map((item, idx) => (
+                      <div
+                        key={item.customer_phone}
+                        onMouseDown={(e) => {
+                          e.preventDefault();
+                          handleSelectPromptCustomer(item);
+                        }}
+                        className={`px-3 py-2 flex items-center justify-between cursor-pointer border-b border-neutral-50 last:border-0 ${
+                          idx === promptSuggestionIndex ? 'bg-neutral-900 text-white' : 'hover:bg-neutral-100 text-neutral-900'
+                        }`}
+                      >
+                        <div className="truncate pr-2">
+                          <div className="font-mono font-semibold text-xs leading-tight">
+                            {item.customer_phone}
+                          </div>
+                          <div className={`text-xs truncate leading-tight mt-0.5 ${
+                            idx === promptSuggestionIndex ? 'text-neutral-200' : 'text-neutral-700 font-medium'
+                          }`}>
+                            {item.customer_name}
+                          </div>
+                        </div>
+                        <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-medium shrink-0 ${
+                          idx === promptSuggestionIndex
+                            ? 'bg-neutral-800 text-white'
+                            : 'bg-neutral-100 text-neutral-700 border border-neutral-200'
+                        }`}>
+                          {item.visit_count} {item.visit_count === 1 ? 'visit' : 'visits'}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="text-xs font-medium text-neutral-700 block mb-1 flex items-center gap-1.5">
+                  <User className="w-3.5 h-3.5 text-neutral-500" />
+                  Customer Name
+                </label>
+                <input
+                  ref={promptNameInputRef}
+                  type="text"
+                  placeholder="Customer name (e.g. Rahul Sharma)"
+                  value={promptCustomerName}
+                  onChange={(e) => setPromptCustomerName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      handleCustomerPromptSubmit();
+                    }
+                  }}
+                  className="w-full px-3 py-2 text-sm border border-neutral-300 rounded focus:border-neutral-900 focus:ring-1 focus:ring-neutral-900 focus:outline-none"
+                />
+              </div>
+
+              {promptCustomerGstin && (
+                <div>
+                  <label className="text-xs font-medium text-neutral-700 block mb-1">
+                    GSTIN (Auto-filled from previous bill)
+                  </label>
+                  <input
+                    type="text"
+                    readOnly
+                    value={promptCustomerGstin}
+                    className="w-full px-3 py-1.5 text-xs font-mono bg-neutral-100 border border-neutral-200 rounded text-neutral-700"
+                  />
+                </div>
+              )}
+            </div>
+
+            <div className="pt-3 border-t border-neutral-100 flex items-center justify-between gap-2">
+              <button
+                type="button"
+                onClick={handleCustomerPromptSkip}
+                className="px-3 py-2 text-xs font-medium text-neutral-600 hover:text-neutral-900 bg-neutral-100 hover:bg-neutral-200 rounded transition-colors"
+                title="Press Esc to skip"
+              >
+                Skip (Walk-in Customer) <span className="font-mono text-[10px] text-neutral-400">[Esc]</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowCustomerPromptModal(false)}
+                  className="px-3 py-2 text-xs font-medium text-neutral-500 hover:text-neutral-700 rounded transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleCustomerPromptSubmit}
+                  className="px-4 py-2 text-xs font-semibold text-white bg-neutral-900 hover:bg-neutral-800 rounded shadow-xs transition-colors flex items-center gap-1.5"
+                  title="Press Enter to save and complete bill"
+                >
+                  <span>Save & Complete Bill</span>
+                  <span className="font-mono text-[10px] opacity-75">[Enter ↵]</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Bill Preview Modal when user clicks "View / PDF" */}
       {activeModalSale && (

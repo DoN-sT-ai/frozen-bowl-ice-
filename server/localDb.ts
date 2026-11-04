@@ -12,6 +12,9 @@ import type {
   SaleItem,
   Expense,
   AuditLog,
+  CashDrawerSession,
+  CashDrawerTransaction,
+  EmployeeTabPermissions,
 } from './db.ts';
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -250,13 +253,78 @@ class LocalDatabaseManager {
       CREATE INDEX IF NOT EXISTS idx_sales_bill_number ON sales(bill_number);
       CREATE INDEX IF NOT EXISTS idx_sales_verification_token ON sales(verification_token);
       CREATE INDEX IF NOT EXISTS idx_sales_created_at ON sales(created_at);
+      CREATE INDEX IF NOT EXISTS idx_sales_customer_phone ON sales(store_id, customer_phone);
       CREATE INDEX IF NOT EXISTS idx_stock_movements_product_id ON stock_movements(product_id);
       CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
       CREATE INDEX IF NOT EXISTS idx_categories_store_id ON categories(store_id);
       CREATE INDEX IF NOT EXISTS idx_sale_items_sale_id ON sale_items(sale_id);
       CREATE INDEX IF NOT EXISTS idx_sale_items_product_id ON sale_items(product_id);
       CREATE INDEX IF NOT EXISTS idx_expenses_store_date ON expenses(store_id, expense_date);
+
+      CREATE TABLE IF NOT EXISTS cash_drawer_sessions (
+        id TEXT PRIMARY KEY,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        opened_by TEXT,
+        opened_by_name TEXT NOT NULL,
+        opened_at TEXT NOT NULL,
+        opening_amount REAL NOT NULL DEFAULT 0.00,
+        opening_denominations_json TEXT DEFAULT '{}',
+        opening_notes TEXT DEFAULT '',
+        closed_by TEXT,
+        closed_by_name TEXT,
+        closed_at TEXT,
+        closing_amount REAL,
+        closing_denominations_json TEXT DEFAULT '{}',
+        closing_notes TEXT DEFAULT '',
+        expected_amount REAL NOT NULL DEFAULT 0.00,
+        cash_sales_amount REAL NOT NULL DEFAULT 0.00,
+        cash_in_amount REAL NOT NULL DEFAULT 0.00,
+        cash_out_amount REAL NOT NULL DEFAULT 0.00,
+        difference REAL DEFAULT 0.00,
+        status TEXT NOT NULL DEFAULT 'OPEN' CHECK (status IN ('OPEN', 'CLOSED')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS cash_drawer_transactions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL REFERENCES cash_drawer_sessions(id) ON DELETE CASCADE,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        type TEXT NOT NULL CHECK (type IN ('OPENING_FLOAT', 'CASH_IN', 'CASH_OUT', 'SALE', 'REFUND')),
+        amount REAL NOT NULL,
+        category TEXT DEFAULT '',
+        reason TEXT DEFAULT '',
+        reference_id TEXT DEFAULT '',
+        performed_by TEXT,
+        performed_by_name TEXT NOT NULL,
+        notes TEXT DEFAULT '',
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS employee_tab_permissions (
+        user_id TEXT PRIMARY KEY,
+        store_id TEXT NOT NULL,
+        permissions_json TEXT NOT NULL DEFAULT '["billing","inventory","sales","movements","cash_control"]',
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS store_printer_settings (
+        store_id TEXT PRIMARY KEY REFERENCES stores(id) ON DELETE CASCADE,
+        settings_json TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_cash_sessions_store_status ON cash_drawer_sessions(store_id, status);
+      CREATE INDEX IF NOT EXISTS idx_cash_sessions_opened_at ON cash_drawer_sessions(opened_at);
+      CREATE INDEX IF NOT EXISTS idx_cash_tx_session ON cash_drawer_transactions(session_id);
+      CREATE INDEX IF NOT EXISTS idx_cash_tx_store_created ON cash_drawer_transactions(store_id, created_at);
     `);
+
+    try {
+      this.db.exec("ALTER TABLE users ADD COLUMN permissions_json TEXT DEFAULT ''");
+    } catch {
+      // Column may already exist
+    }
 
     try {
       this.db.exec("ALTER TABLE sale_items ADD COLUMN modifiers_json TEXT DEFAULT '[]'");
@@ -374,15 +442,21 @@ class LocalDatabaseManager {
       `);
     } catch (_) {}
 
-    // Ensure default developer configs for Supabase Cloud Authentication are always present
+    // Ensure default developer configs for Supabase Cloud Authentication are present if configured
     try {
       const now = new Date().toISOString();
       const insertDefaultConfig = this.db.prepare(
         'INSERT OR IGNORE INTO developer_configs (key, value, updated_at) VALUES (?, ?, ?)'
       );
-      insertDefaultConfig.run('SUPABASE_URL', 'https://sxzaalvmkkdnczrtzitd.supabase.co', now);
-      insertDefaultConfig.run('SUPABASE_ANON_KEY', 'sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM', now);
-      insertDefaultConfig.run('SUPABASE_SERVICE_ROLE_KEY', 'sb_publishable_0eosb1s_HO_94uv-4Rnlkw_9CVWYBGM', now);
+      if (process.env.SUPABASE_URL) {
+        insertDefaultConfig.run('SUPABASE_URL', process.env.SUPABASE_URL.trim(), now);
+      }
+      if (process.env.SUPABASE_ANON_KEY) {
+        insertDefaultConfig.run('SUPABASE_ANON_KEY', process.env.SUPABASE_ANON_KEY.trim(), now);
+      }
+      if (process.env.SUPABASE_SERVICE_ROLE_KEY) {
+        insertDefaultConfig.run('SUPABASE_SERVICE_ROLE_KEY', process.env.SUPABASE_SERVICE_ROLE_KEY.trim(), now);
+      }
     } catch (_) {}
   }
 
@@ -557,6 +631,117 @@ export class LocalDb {
     );
 
     return updated;
+  }
+
+  static async getPrinterSettings(storeId?: string): Promise<any | null> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    try {
+      const row = this.db.prepare('SELECT settings_json FROM store_printer_settings WHERE store_id = ?').get(validStoreId) as any;
+      if (!row || !row.settings_json) return null;
+      return JSON.parse(row.settings_json);
+    } catch {
+      return null;
+    }
+  }
+
+  static async savePrinterSettings(storeId: string, settings: any): Promise<any> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const now = new Date().toISOString();
+    const settingsJson = JSON.stringify(settings);
+    this.db.prepare(`
+      INSERT INTO store_printer_settings (store_id, settings_json, updated_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT(store_id) DO UPDATE SET
+        settings_json = excluded.settings_json,
+        updated_at = excluded.updated_at
+    `).run(validStoreId, settingsJson, now);
+    return settings;
+  }
+
+  static async syncStoreFromCloud(storeData: {
+    id?: string;
+    name: string;
+    code?: string;
+    address?: string;
+    phone?: string;
+    email?: string;
+    gstin?: string;
+    currency?: string;
+    invoice_prefix?: string;
+  }): Promise<Store> {
+    const rawDb = this.getRawDb();
+    const now = new Date().toISOString();
+
+    // Check if store already exists in SQLite by exact ID, code, or name
+    let existing: Store | null = null;
+    if (storeData.id) {
+      existing = await this.getStore(storeData.id);
+    }
+    if (!existing && storeData.code) {
+      const row = rawDb.prepare('SELECT * FROM stores WHERE LOWER(code) = LOWER(?)').get(storeData.code) as any;
+      if (row) existing = row as Store;
+    }
+    if (!existing && storeData.name) {
+      const row = rawDb.prepare('SELECT * FROM stores WHERE LOWER(name) = LOWER(?)').get(storeData.name) as any;
+      if (row) existing = row as Store;
+    }
+
+    if (existing) {
+      rawDb.prepare(`
+        UPDATE stores
+        SET name = ?,
+            code = COALESCE(?, code),
+            address = COALESCE(?, address),
+            phone = COALESCE(?, phone),
+            email = COALESCE(?, email),
+            gstin = COALESCE(?, gstin),
+            currency = COALESCE(?, currency),
+            invoice_prefix = COALESCE(?, invoice_prefix),
+            updated_at = ?
+        WHERE id = ?
+      `).run(
+        storeData.name,
+        storeData.code || null,
+        storeData.address || null,
+        storeData.phone || null,
+        storeData.email || null,
+        storeData.gstin || null,
+        storeData.currency || null,
+        storeData.invoice_prefix || null,
+        now,
+        existing.id
+      );
+      return (await this.getStore(existing.id))!;
+    } else {
+      const targetId = storeData.id || crypto.randomUUID();
+      const code = storeData.code || storeData.name.toUpperCase().replace(/[^A-Z0-9]/g, '-').slice(0, 10);
+      rawDb.prepare(`
+        INSERT INTO stores (id, name, code, address, phone, email, gstin, currency, timezone, invoice_prefix, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        targetId,
+        storeData.name,
+        code,
+        storeData.address || '',
+        storeData.phone || '',
+        storeData.email || '',
+        storeData.gstin || '',
+        storeData.currency || 'INR',
+        'Asia/Kolkata',
+        storeData.invoice_prefix || 'INV-',
+        now,
+        now
+      );
+
+      // Seed starter categories for this distinct shop
+      this.seedDefaultCategories(targetId, [
+        { name: 'Specialties', description: 'House specialty recipes' },
+        { name: 'Beverages', description: 'Drinks & beverages' },
+        { name: 'Desserts', description: 'Desserts & frozen items' },
+      ]);
+
+      return (await this.getStore(targetId))!;
+    }
   }
 
   // USERS
@@ -1064,6 +1249,320 @@ export class LocalDb {
     } as Sale;
   }
 
+  static async getSaleById(id: string): Promise<Sale | null> {
+    const saleRow = this.db.prepare('SELECT * FROM sales WHERE id = ?').get(id.trim()) as any;
+    if (!saleRow) return null;
+
+    const itemsRows = this.db.prepare('SELECT * FROM sale_items WHERE sale_id = ? ORDER BY created_at ASC').all(saleRow.id) as any[];
+
+    return {
+      ...saleRow,
+      subtotal: Number(saleRow.subtotal) || 0,
+      discount: Number(saleRow.discount) || 0,
+      tax: Number(saleRow.tax) || 0,
+      cgst: saleRow.cgst != null ? Number(saleRow.cgst) : undefined,
+      sgst: saleRow.sgst != null ? Number(saleRow.sgst) : undefined,
+      igst: saleRow.igst != null ? Number(saleRow.igst) : undefined,
+      round_off: saleRow.round_off != null ? Number(saleRow.round_off) : undefined,
+      total: Number(saleRow.total) || 0,
+      items: itemsRows.map(item => ({
+        ...item,
+        quantity: Number(item.quantity) || 0,
+        unit_price: Number(item.unit_price) || 0,
+        purchase_price_snapshot: Number(item.purchase_price_snapshot) || 0,
+        tax_rate: Number(item.tax_rate) || 0,
+        tax_amount: Number(item.tax_amount) || 0,
+        taxable_value: item.taxable_value != null ? Number(item.taxable_value) : undefined,
+        cgst_amount: item.cgst_amount != null ? Number(item.cgst_amount) : undefined,
+        sgst_amount: item.sgst_amount != null ? Number(item.sgst_amount) : undefined,
+        igst_amount: item.igst_amount != null ? Number(item.igst_amount) : undefined,
+        discount: Number(item.discount) || 0,
+        line_total: Number(item.line_total) || 0,
+        selected_modifiers: item.modifiers_json ? (() => { try { return JSON.parse(item.modifiers_json); } catch { return undefined; } })() : undefined,
+      })),
+    } as Sale;
+  }
+
+  static async getCustomerByPhone(storeId: string, phone: string): Promise<{ customer_name: string; customer_phone: string; customer_gstin?: string } | null> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const row = this.db.prepare(`
+      SELECT customer_name, customer_phone, customer_gstin
+      FROM sales
+      WHERE store_id = ? AND customer_phone = ? AND customer_name IS NOT NULL AND TRIM(customer_name) != ''
+      ORDER BY created_at DESC LIMIT 1
+    `).get(validStoreId, phone.trim()) as any;
+    if (!row) return null;
+    return {
+      customer_name: row.customer_name,
+      customer_phone: row.customer_phone,
+      customer_gstin: row.customer_gstin || undefined,
+    };
+  }
+
+  static async searchCustomers(
+    storeId: string,
+    query: string,
+    limit = 8
+  ): Promise<Array<{
+    customer_name: string;
+    customer_phone: string;
+    customer_gstin?: string;
+    visit_count: number;
+    total_spend: number;
+    last_visit: string;
+  }>> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const cleanQ = (query || '').trim();
+    if (!cleanQ) return [];
+
+    const pattern = `%${cleanQ}%`;
+    const rows = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as visit_count,
+        ROUND(SUM(total), 2) as total_spend,
+        MAX(created_at) as last_visit
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+        AND (customer_phone LIKE ? OR customer_name LIKE ?)
+      GROUP BY customer_phone
+      ORDER BY 
+        CASE WHEN customer_phone LIKE ? THEN 0 ELSE 1 END,
+        visit_count DESC,
+        last_visit DESC
+      LIMIT ?
+    `).all(validStoreId, pattern, pattern, `${cleanQ}%`, limit) as any[];
+
+    return rows.map(r => ({
+      customer_name: r.customer_name,
+      customer_phone: r.customer_phone,
+      customer_gstin: r.customer_gstin || undefined,
+      visit_count: Number(r.visit_count) || 1,
+      total_spend: Number(r.total_spend) || 0,
+      last_visit: r.last_visit,
+    }));
+  }
+
+  static async getCustomerAnalytics(storeId: string): Promise<{
+    summary: {
+      total_unique_customers: number;
+      repeat_customers: number;
+      repeat_rate: number;
+      total_spend: number;
+      avg_spend_per_customer: number;
+      visits_this_week: number;
+      visits_last_week: number;
+      new_customers_this_week: number;
+    };
+    customers: Array<{
+      customer_name: string;
+      customer_phone: string;
+      customer_gstin?: string;
+      total_visits: number;
+      total_spend: number;
+      avg_bill_value: number;
+      first_visit: string;
+      last_visit: string;
+      tier: 'VIP' | 'REGULAR' | 'NEW';
+      favorite_items: string[];
+    }>;
+    weekly_trends: Array<{
+      date: string;
+      day_name: string;
+      visit_count: number;
+      revenue: number;
+    }>;
+  }> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+
+    // Fetch grouped customer records
+    const customerRows = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as total_visits,
+        ROUND(SUM(total), 2) as total_spend,
+        ROUND(AVG(total), 2) as avg_bill_value,
+        MIN(created_at) as first_visit,
+        MAX(created_at) as last_visit
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+      GROUP BY customer_phone
+      ORDER BY total_visits DESC, total_spend DESC
+    `).all(validStoreId) as any[];
+
+    // Fetch favorite items for all customers
+    const favoriteItemsRows = this.db.prepare(`
+      SELECT 
+        s.customer_phone,
+        si.product_name_snapshot,
+        SUM(si.quantity) as total_qty
+      FROM sale_items si
+      JOIN sales s ON si.sale_id = s.id
+      WHERE s.store_id = ? AND s.customer_phone IS NOT NULL AND TRIM(s.customer_phone) != ''
+      GROUP BY s.customer_phone, si.product_name_snapshot
+      ORDER BY s.customer_phone, total_qty DESC
+    `).all(validStoreId) as any[];
+
+    const customerFavMap = new Map<string, string[]>();
+    for (const row of favoriteItemsRows) {
+      const list = customerFavMap.get(row.customer_phone) || [];
+      if (list.length < 3 && row.product_name_snapshot) {
+        list.push(row.product_name_snapshot);
+        customerFavMap.set(row.customer_phone, list);
+      }
+    }
+
+    const customers = customerRows.map(c => {
+      const visits = Number(c.total_visits) || 1;
+      let tier: 'VIP' | 'REGULAR' | 'NEW' = 'NEW';
+      if (visits >= 5) tier = 'VIP';
+      else if (visits >= 2) tier = 'REGULAR';
+
+      return {
+        customer_name: c.customer_name,
+        customer_phone: c.customer_phone,
+        customer_gstin: c.customer_gstin || undefined,
+        total_visits: visits,
+        total_spend: Number(c.total_spend) || 0,
+        avg_bill_value: Number(c.avg_bill_value) || 0,
+        first_visit: c.first_visit,
+        last_visit: c.last_visit,
+        tier,
+        favorite_items: customerFavMap.get(c.customer_phone) || [],
+      };
+    });
+
+    const totalUnique = customers.length;
+    const repeatCount = customers.filter(c => c.total_visits > 1).length;
+    const repeatRate = totalUnique > 0 ? Math.round((repeatCount / totalUnique) * 1000) / 10 : 0;
+    const totalSpend = customers.reduce((acc, c) => acc + c.total_spend, 0);
+    const avgSpendPerCustomer = totalUnique > 0 ? Math.round((totalSpend / totalUnique) * 100) / 100 : 0;
+
+    // Weekly visits comparison
+    const weekStats = this.db.prepare(`
+      SELECT 
+        COUNT(CASE WHEN created_at >= date('now', '-7 days') THEN 1 END) as this_week,
+        COUNT(CASE WHEN created_at >= date('now', '-14 days') AND created_at < date('now', '-7 days') THEN 1 END) as last_week,
+        COUNT(CASE WHEN created_at >= date('now', '-7 days') AND customer_phone IN (
+          SELECT customer_phone FROM sales WHERE store_id = ? GROUP BY customer_phone HAVING MIN(created_at) >= date('now', '-7 days')
+        ) THEN 1 END) as new_this_week
+      FROM sales
+      WHERE store_id = ? AND customer_phone IS NOT NULL AND TRIM(customer_phone) != ''
+    `).get(validStoreId, validStoreId) as any;
+
+    // Last 7 days breakdown for visual chart (normalized to exactly 7 days)
+    const dailyRows = this.db.prepare(`
+      SELECT 
+        strftime('%Y-%m-%d', created_at) as day_date,
+        COUNT(*) as visit_count,
+        ROUND(SUM(total), 2) as revenue
+      FROM sales
+      WHERE store_id = ? 
+        AND customer_phone IS NOT NULL 
+        AND TRIM(customer_phone) != ''
+        AND created_at >= date('now', '-7 days')
+      GROUP BY strftime('%Y-%m-%d', created_at)
+      ORDER BY day_date ASC
+    `).all(validStoreId) as any[];
+
+    const dailyMap = new Map<string, { visit_count: number; revenue: number }>();
+    for (const r of dailyRows) {
+      dailyMap.set(r.day_date, {
+        visit_count: Number(r.visit_count) || 0,
+        revenue: Number(r.revenue) || 0,
+      });
+    }
+
+    const daysMap = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    const weeklyTrends = [];
+    const now = new Date();
+    for (let i = 6; i >= 0; i--) {
+      const d = new Date(now);
+      d.setDate(d.getDate() - i);
+      const isoDate = d.toISOString().slice(0, 10);
+      const stats = dailyMap.get(isoDate) || { visit_count: 0, revenue: 0 };
+      weeklyTrends.push({
+        date: isoDate,
+        day_name: daysMap[d.getDay()],
+        visit_count: stats.visit_count,
+        revenue: stats.revenue,
+      });
+    }
+
+    return {
+      summary: {
+        total_unique_customers: totalUnique,
+        repeat_customers: repeatCount,
+        repeat_rate: repeatRate,
+        total_spend: totalSpend,
+        avg_spend_per_customer: avgSpendPerCustomer,
+        visits_this_week: Number(weekStats?.this_week) || 0,
+        visits_last_week: Number(weekStats?.last_week) || 0,
+        new_customers_this_week: Number(weekStats?.new_this_week) || 0,
+      },
+      customers,
+      weekly_trends: weeklyTrends,
+    };
+  }
+
+  static async getCustomerHistory(storeId: string, phone: string): Promise<{
+    customer: {
+      customer_name: string;
+      customer_phone: string;
+      customer_gstin?: string;
+      total_visits: number;
+      total_spend: number;
+    } | null;
+    sales: Sale[];
+  }> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const cleanPhone = (phone || '').trim();
+    if (!cleanPhone) return { customer: null, sales: [] };
+
+    const saleRows = this.db.prepare(`
+      SELECT id FROM sales
+      WHERE store_id = ? AND customer_phone = ?
+      ORDER BY created_at DESC
+    `).all(validStoreId, cleanPhone) as any[];
+
+    const sales: Sale[] = [];
+    for (const r of saleRows) {
+      const s = await this.getSaleById(r.id);
+      if (s) sales.push(s);
+    }
+
+    const customerSummary = this.db.prepare(`
+      SELECT 
+        customer_phone,
+        COALESCE(MAX(CASE WHEN customer_name IS NOT NULL AND TRIM(customer_name) != '' THEN customer_name END), 'Customer') as customer_name,
+        MAX(customer_gstin) as customer_gstin,
+        COUNT(*) as total_visits,
+        ROUND(SUM(total), 2) as total_spend
+      FROM sales
+      WHERE store_id = ? AND customer_phone = ?
+      GROUP BY customer_phone
+    `).get(validStoreId, cleanPhone) as any;
+
+    return {
+      customer: customerSummary ? {
+        customer_name: customerSummary.customer_name,
+        customer_phone: customerSummary.customer_phone,
+        customer_gstin: customerSummary.customer_gstin || undefined,
+        total_visits: Number(customerSummary.total_visits) || 0,
+        total_spend: Number(customerSummary.total_spend) || 0,
+      } : null,
+      sales,
+    };
+  }
+
   static async createSale(
     sale: Omit<Sale, 'id' | 'created_at' | 'items'>,
     items: Omit<SaleItem, 'id' | 'sale_id' | 'created_at'>[]
@@ -1319,6 +1818,241 @@ export class LocalDb {
     const nextVal = seqRow?.last_number || 1;
     const formattedNum = String(nextVal).padStart(6, '0');
     return `${billPrefix}${formattedNum}`;
+  }
+
+  // ==========================================
+  // CASH DRAWER CONTROL & SESSIONS
+  // ==========================================
+
+  static async getActiveCashDrawerSession(storeId: string): Promise<CashDrawerSession | null> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ? AND status = 'OPEN'
+      ORDER BY opened_at DESC LIMIT 1
+    `).get(validStoreId) as any;
+
+    if (!row) return null;
+    return {
+      ...row,
+      opening_amount: Number(row.opening_amount) || 0,
+      closing_amount: row.closing_amount !== null && row.closing_amount !== undefined ? Number(row.closing_amount) : undefined,
+      expected_amount: Number(row.expected_amount) || 0,
+      cash_sales_amount: Number(row.cash_sales_amount) || 0,
+      cash_in_amount: Number(row.cash_in_amount) || 0,
+      cash_out_amount: Number(row.cash_out_amount) || 0,
+      difference: row.difference !== null && row.difference !== undefined ? Number(row.difference) : undefined,
+    } as CashDrawerSession;
+  }
+
+  static async getLastClosedCashDrawerSession(storeId: string): Promise<CashDrawerSession | null> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ? AND status = 'CLOSED'
+      ORDER BY closed_at DESC, opened_at DESC LIMIT 1
+    `).get(validStoreId) as any;
+
+    if (!row) return null;
+    return {
+      ...row,
+      opening_amount: Number(row.opening_amount) || 0,
+      closing_amount: row.closing_amount !== null && row.closing_amount !== undefined ? Number(row.closing_amount) : 0,
+      expected_amount: Number(row.expected_amount) || 0,
+      cash_sales_amount: Number(row.cash_sales_amount) || 0,
+      cash_in_amount: Number(row.cash_in_amount) || 0,
+      cash_out_amount: Number(row.cash_out_amount) || 0,
+      difference: row.difference !== null && row.difference !== undefined ? Number(row.difference) : 0,
+    } as CashDrawerSession;
+  }
+
+  static async getCashDrawerSession(sessionId: string): Promise<CashDrawerSession | null> {
+    const row = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions WHERE id = ?
+    `).get(sessionId) as any;
+
+    if (!row) return null;
+    return {
+      ...row,
+      opening_amount: Number(row.opening_amount) || 0,
+      closing_amount: row.closing_amount !== null && row.closing_amount !== undefined ? Number(row.closing_amount) : undefined,
+      expected_amount: Number(row.expected_amount) || 0,
+      cash_sales_amount: Number(row.cash_sales_amount) || 0,
+      cash_in_amount: Number(row.cash_in_amount) || 0,
+      cash_out_amount: Number(row.cash_out_amount) || 0,
+      difference: row.difference !== null && row.difference !== undefined ? Number(row.difference) : undefined,
+    } as CashDrawerSession;
+  }
+
+  static async createCashDrawerSession(session: Omit<CashDrawerSession, 'id' | 'created_at' | 'updated_at'>): Promise<CashDrawerSession> {
+    const id = ensureUuid((session as any).id);
+    const storeId = this.resolveValidStoreId(session.store_id);
+    const now = new Date().toISOString();
+    const openedBy = nullableUuid(session.opened_by);
+
+    this.db.prepare(`
+      INSERT INTO cash_drawer_sessions (
+        id, store_id, opened_by, opened_by_name, opened_at,
+        opening_amount, opening_denominations_json, opening_notes,
+        closed_by, closed_by_name, closed_at,
+        closing_amount, closing_denominations_json, closing_notes,
+        expected_amount, cash_sales_amount, cash_in_amount, cash_out_amount,
+        difference, status, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      storeId,
+      openedBy,
+      session.opened_by_name || 'Cashier',
+      session.opened_at || now,
+      Number(session.opening_amount) || 0,
+      session.opening_denominations_json || '{}',
+      session.opening_notes || '',
+      session.closed_by || null,
+      session.closed_by_name || null,
+      session.closed_at || null,
+      session.closing_amount !== undefined ? Number(session.closing_amount) : null,
+      session.closing_denominations_json || '{}',
+      session.closing_notes || '',
+      Number(session.expected_amount) || Number(session.opening_amount) || 0,
+      Number(session.cash_sales_amount) || 0,
+      Number(session.cash_in_amount) || 0,
+      Number(session.cash_out_amount) || 0,
+      session.difference !== undefined ? Number(session.difference) : 0,
+      session.status || 'OPEN',
+      now,
+      now
+    );
+
+    return (await this.getCashDrawerSession(id))!;
+  }
+
+  static async updateCashDrawerSession(sessionId: string, updates: Partial<CashDrawerSession>): Promise<CashDrawerSession> {
+    const existing = await this.getCashDrawerSession(sessionId);
+    if (!existing) throw new Error('Cash drawer session not found');
+
+    const now = new Date().toISOString();
+    const fields: string[] = ['updated_at = ?'];
+    const values: any[] = [now];
+
+    if (updates.closed_by !== undefined) { fields.push('closed_by = ?'); values.push(nullableUuid(updates.closed_by)); }
+    if (updates.closed_by_name !== undefined) { fields.push('closed_by_name = ?'); values.push(updates.closed_by_name); }
+    if (updates.closed_at !== undefined) { fields.push('closed_at = ?'); values.push(updates.closed_at); }
+    if (updates.closing_amount !== undefined) { fields.push('closing_amount = ?'); values.push(Number(updates.closing_amount)); }
+    if (updates.closing_denominations_json !== undefined) { fields.push('closing_denominations_json = ?'); values.push(updates.closing_denominations_json); }
+    if (updates.closing_notes !== undefined) { fields.push('closing_notes = ?'); values.push(updates.closing_notes); }
+    if (updates.expected_amount !== undefined) { fields.push('expected_amount = ?'); values.push(Number(updates.expected_amount)); }
+    if (updates.cash_sales_amount !== undefined) { fields.push('cash_sales_amount = ?'); values.push(Number(updates.cash_sales_amount)); }
+    if (updates.cash_in_amount !== undefined) { fields.push('cash_in_amount = ?'); values.push(Number(updates.cash_in_amount)); }
+    if (updates.cash_out_amount !== undefined) { fields.push('cash_out_amount = ?'); values.push(Number(updates.cash_out_amount)); }
+    if (updates.difference !== undefined) { fields.push('difference = ?'); values.push(Number(updates.difference)); }
+    if (updates.status !== undefined) { fields.push('status = ?'); values.push(updates.status); }
+
+    values.push(sessionId);
+    this.db.prepare(`UPDATE cash_drawer_sessions SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+
+    return (await this.getCashDrawerSession(sessionId))!;
+  }
+
+  static async listCashDrawerSessions(storeId: string, limit = 50): Promise<CashDrawerSession[]> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const rows = this.db.prepare(`
+      SELECT * FROM cash_drawer_sessions
+      WHERE store_id = ?
+      ORDER BY opened_at DESC
+      LIMIT ?
+    `).all(validStoreId, limit) as any[];
+
+    return rows.map(r => ({
+      ...r,
+      opening_amount: Number(r.opening_amount) || 0,
+      closing_amount: r.closing_amount !== null && r.closing_amount !== undefined ? Number(r.closing_amount) : undefined,
+      expected_amount: Number(r.expected_amount) || 0,
+      cash_sales_amount: Number(r.cash_sales_amount) || 0,
+      cash_in_amount: Number(r.cash_in_amount) || 0,
+      cash_out_amount: Number(r.cash_out_amount) || 0,
+      difference: r.difference !== null && r.difference !== undefined ? Number(r.difference) : undefined,
+    })) as CashDrawerSession[];
+  }
+
+  static async createCashDrawerTransaction(tx: Omit<CashDrawerTransaction, 'id' | 'created_at'>): Promise<CashDrawerTransaction> {
+    const id = ensureUuid((tx as any).id);
+    const storeId = this.resolveValidStoreId(tx.store_id);
+    const now = new Date().toISOString();
+    const performedBy = nullableUuid(tx.performed_by);
+
+    this.db.prepare(`
+      INSERT INTO cash_drawer_transactions (
+        id, session_id, store_id, type, amount, category, reason, reference_id, performed_by, performed_by_name, notes, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      id,
+      tx.session_id,
+      storeId,
+      tx.type,
+      Number(tx.amount) || 0,
+      tx.category || '',
+      tx.reason || '',
+      tx.reference_id || '',
+      performedBy,
+      tx.performed_by_name || 'Staff',
+      tx.notes || '',
+      now
+    );
+
+    return {
+      ...tx,
+      id,
+      store_id: storeId,
+      performed_by: performedBy || undefined,
+      created_at: now,
+    } as CashDrawerTransaction;
+  }
+
+  static async getCashDrawerTransactions(sessionId: string): Promise<CashDrawerTransaction[]> {
+    const rows = this.db.prepare(`
+      SELECT * FROM cash_drawer_transactions
+      WHERE session_id = ?
+      ORDER BY created_at ASC
+    `).all(sessionId) as any[];
+
+    return rows.map(r => ({
+      ...r,
+      amount: Number(r.amount) || 0,
+    })) as CashDrawerTransaction[];
+  }
+
+  // ==========================================
+  // EMPLOYEE TAB PERMISSIONS
+  // ==========================================
+
+  static async getEmployeePermissions(userId: string, storeId: string): Promise<string[]> {
+    try {
+      const row = this.db.prepare('SELECT permissions_json FROM employee_tab_permissions WHERE user_id = ?').get(userId) as any;
+      if (row?.permissions_json) {
+        return JSON.parse(row.permissions_json);
+      }
+      const userRow = this.db.prepare('SELECT permissions_json FROM users WHERE id = ?').get(userId) as any;
+      if (userRow?.permissions_json) {
+        return JSON.parse(userRow.permissions_json);
+      }
+    } catch (_) {}
+    return ['billing', 'inventory', 'sales', 'movements', 'cash_control'];
+  }
+
+  static async setEmployeePermissions(userId: string, storeId: string, permissions: string[]): Promise<void> {
+    const now = new Date().toISOString();
+    const json = JSON.stringify(permissions);
+
+    this.db.prepare(`
+      INSERT INTO employee_tab_permissions (user_id, store_id, permissions_json, updated_at)
+      VALUES (?, ?, ?, ?)
+      ON CONFLICT(user_id) DO UPDATE SET permissions_json = excluded.permissions_json, updated_at = excluded.updated_at
+    `).run(userId, storeId, json, now);
+
+    try {
+      this.db.prepare('UPDATE users SET permissions_json = ? WHERE id = ?').run(json, userId);
+    } catch (_) {}
   }
 
   // EXPORT BACKUP

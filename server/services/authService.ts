@@ -49,7 +49,27 @@ export function verifyToken(token: string): SessionData | null {
 // In-memory active sessions map (used as local cache)
 const activeSessions = new Map<string, SessionData>();
 
-export function safeUser(u: User) {
+export function getPermissionsSync(userId: string, role: string): string[] {
+  const allTabs = ['billing', 'inventory', 'movements', 'sales', 'cash_control', 'customers', 'expenses', 'reports', 'dashboard', 'employees', 'audit', 'settings'];
+  if (role === 'ADMIN' || role === 'DEVELOPER') {
+    return allTabs;
+  }
+  try {
+    const rawDb = LocalDb.getRawDb();
+    const row = rawDb.prepare('SELECT permissions_json FROM employee_tab_permissions WHERE user_id = ?').get(userId) as any;
+    if (row?.permissions_json) {
+      return JSON.parse(row.permissions_json);
+    }
+    const uRow = rawDb.prepare('SELECT permissions_json FROM users WHERE id = ?').get(userId) as any;
+    if (uRow?.permissions_json) {
+      return JSON.parse(uRow.permissions_json);
+    }
+  } catch (_) {}
+  return ['billing', 'inventory', 'sales', 'movements', 'cash_control', 'customers'];
+}
+
+export function safeUser(u: User, permissions?: string[]) {
+  const effectivePermissions = permissions || getPermissionsSync(u.id, u.role);
   return {
     id: u.id,
     store_id: u.store_id,
@@ -59,6 +79,7 @@ export function safeUser(u: User) {
     active: u.active,
     last_login_at: u.last_login_at,
     created_at: u.created_at,
+    permissions: effectivePermissions,
   };
 }
 
@@ -182,9 +203,13 @@ export class AuthService {
     }
 
     // Remote Kill-Switch & Blocking Guardrail:
-    // If the user is deactivated or blocked in Supabase, immediately reject login!
-    const isBlocked = user.active === false || (user as any).is_blocked === true || (user as any).status === 'BLOCKED' || (user as any).status === 'INACTIVE';
-    if (isBlocked) {
+    // 1) User-Level Blocking in Supabase
+    const isUserBlocked =
+      user.active === false ||
+      (user as any).is_blocked === true ||
+      ['BLOCKED', 'INACTIVE', 'SUSPENDED'].includes(String(user.status || '').toUpperCase());
+
+    if (isUserBlocked) {
       AuditService.log({
         storeId: user.store_id,
         userId: user.id,
@@ -192,6 +217,54 @@ export class AuthService {
         action: 'LOGIN_BLOCKED_INACTIVE',
         entityType: 'AUTH',
         afterData: { email: cleanEmail, reason: 'contact admin and renew the plan' },
+        ipAddress: ip,
+        userAgent,
+      });
+      throw new Error('contact admin and renew the plan');
+    }
+
+    // 2) Multi-Store Remote Kill-Switch in Supabase:
+    // If the admin stops the shop (e.g. "Frozen Bowl" or "2ice") in Supabase,
+    // all users of that store are strictly blocked from logging in.
+    const storeLookupKey = user.store_id || (user as any).store_name;
+    let cloudStore = storeLookupKey ? await SupabaseDb.getStoreFromCloud(storeLookupKey) : null;
+    if (!cloudStore && (user as any).store_name) {
+      cloudStore = await SupabaseDb.getStoreFromCloud((user as any).store_name);
+    }
+
+    // A) If store was found in Supabase 'stores' table and is stopped/inactive:
+    if (cloudStore && cloudStore.is_stopped) {
+      AuditService.log({
+        storeId: cloudStore.id,
+        userId: user.id,
+        userName: user.name,
+        action: 'LOGIN_BLOCKED_STORE_STOPPED',
+        entityType: 'AUTH',
+        afterData: {
+          email: cleanEmail,
+          storeName: cloudStore.name,
+          storeStatus: cloudStore.status,
+          reason: 'contact admin and renew the plan'
+        },
+        ipAddress: ip,
+        userAgent,
+      });
+      throw new Error('contact admin and renew the plan');
+    }
+
+    // B) If store was stopped directly via user columns (store_status or store_active):
+    if ((user as any).is_store_stopped) {
+      AuditService.log({
+        storeId: user.store_id,
+        userId: user.id,
+        userName: user.name,
+        action: 'LOGIN_BLOCKED_STORE_STOPPED',
+        entityType: 'AUTH',
+        afterData: {
+          email: cleanEmail,
+          storeName: (user as any).store_name || user.store_id,
+          reason: 'contact admin and renew the plan'
+        },
         ipAddress: ip,
         userAgent,
       });
@@ -221,9 +294,33 @@ export class AuthService {
     const now = new Date().toISOString();
     await SupabaseDb.updateUser(user.id, { last_login_at: now }).catch(() => {});
 
+    // Multi-Shop Store Alignment & Synchronisation:
+    // Sync the shop identity from Supabase Cloud to local SQLite database so POS headers,
+    // receipts, and store settings accurately display the user's shop ("Frozen Bowl", "2ice", etc.)
+    const effectiveStoreName = cloudStore?.name || (user as any).store_name;
+    let syncedStore = null;
+    if (effectiveStoreName) {
+      try {
+        syncedStore = await LocalDb.syncStoreFromCloud({
+          id: cloudStore?.id || user.store_id,
+          name: effectiveStoreName,
+          code: cloudStore?.code,
+          address: cloudStore?.address,
+          phone: cloudStore?.phone,
+          email: cloudStore?.email,
+          gstin: cloudStore?.gstin,
+          currency: cloudStore?.currency || 'INR',
+          invoice_prefix: cloudStore?.invoice_prefix,
+        });
+        await db.syncFromLocalDb();
+      } catch (syncErr) {
+        console.warn('[StoreSync] Notice syncing store from cloud:', syncErr);
+      }
+    }
+
     // Create stateless signed session token (serverless compatible)
     // Resolve canonical local store to ensure perfect foreign key alignment with SQLite ledger
-    const primaryStore = (await LocalDb.getFirstStore()) || (await LocalDb.getStore(user.store_id));
+    const primaryStore = syncedStore || (await LocalDb.getFirstStore()) || (await LocalDb.getStore(user.store_id));
     if (primaryStore) {
       user.store_id = primaryStore.id;
     }
@@ -283,6 +380,7 @@ export class AuthService {
         active: true,
         last_login_at: undefined,
         created_at: new Date(session.createdAt).toISOString(),
+        permissions: getPermissionsSync(session.userId, session.role),
       },
       store,
       session,
