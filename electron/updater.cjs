@@ -549,12 +549,12 @@ ipcMain.handle('updater:install', async () => {
     const currentExe = process.execPath;
     const runnerScriptPath = path.join(updateDir, 'apply-update.ps1');
 
-    // Dedicated PowerShell update runner:
-    // 1. Monitors current process PID and waits until calling process has terminated.
-    // 2. Kills any lingering FryFreeze child/auxiliary processes (GPU, renderers, crashpad) to release file locks.
-    // 3. Waits an extra 1000ms grace period so Windows fully clears all DLL & SQLite file locks.
-    // 4. Runs NSIS silently with /S and --updated (without prompting, in-place update).
-    // 5. Waits for installer to finish, then relaunches FryFreeze automatically.
+    // Dedicated PowerShell update runner with native progress indicator window:
+    // 1. Shows a sleek centered dialog indicating the update is being extracted and applied.
+    // 2. Monitors calling process PID and waits until it exits.
+    // 3. Kills any lingering child processes so Windows releases all executable file locks.
+    // 4. Executes NSIS silently with /S --updated --force-run while updating the status message.
+    // 5. Verifies relaunch via Win32_Process fallback and closes the progress window.
     const runnerScriptContent = `
 param(
   [int]$TargetPid,
@@ -572,34 +572,80 @@ Log-Msg "TargetPid: $TargetPid"
 Log-Msg "InstallerPath: $InstallerPath"
 Log-Msg "AppExePath: $AppExePath"
 
-# 1. Wait for caller process to exit
+# 1. Native Windows Progress / Splash Dialog
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "FryFreeze POS - Updating"
+$form.Size = New-Object System.Drawing.Size(430, 165)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
+$form.MinimizeBox = $false
+$form.TopMost = $true
+$form.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#0f172a")
+
+$labelTitle = New-Object System.Windows.Forms.Label
+$labelTitle.Text = "Updating FryFreeze POS..."
+$labelTitle.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
+$labelTitle.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#f8fafc")
+$labelTitle.AutoSize = $true
+$labelTitle.Location = New-Object System.Drawing.Point(24, 20)
+$form.Controls.Add($labelTitle)
+
+$labelDesc = New-Object System.Windows.Forms.Label
+$labelDesc.Text = "Applying verified update package. Relaunching in ~15s..."
+$labelDesc.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Regular)
+$labelDesc.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#94a3b8")
+$labelDesc.Size = New-Object System.Drawing.Size(375, 24)
+$labelDesc.Location = New-Object System.Drawing.Point(24, 50)
+$form.Controls.Add($labelDesc)
+
+$progressBar = New-Object System.Windows.Forms.ProgressBar
+$progressBar.Style = "Marquee"
+$progressBar.MarqueeAnimationSpeed = 30
+$progressBar.Size = New-Object System.Drawing.Size(370, 10)
+$progressBar.Location = New-Object System.Drawing.Point(24, 82)
+$form.Controls.Add($progressBar)
+
+$form.Show()
+$form.Refresh()
+
+# 2. Wait for caller process to exit
 $waitCount = 0
 while ((Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) -and ($waitCount -lt 40)) {
   Start-Sleep -Milliseconds 250
+  $form.Refresh()
   $waitCount++
 }
 Log-Msg "Target process $TargetPid exited (waited $($waitCount * 250)ms)"
 
-# 2. Terminate any lingering FryFreeze child/aux processes to clear DLL/EXE locks
+# 3. Terminate lingering child/auxiliary processes to release file locks
 Log-Msg "Terminating lingering FryFreeze processes..."
 Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-# 3. Grace period for Windows file locks
+# 4. Grace period for Windows file locks
 Start-Sleep -Milliseconds 1000
+$form.Refresh()
 
-# 4. Run NSIS installer silently with auto-relaunch (--force-run)
+# 5. Run NSIS installer silently with auto-relaunch (--force-run)
 if (Test-Path -LiteralPath $InstallerPath) {
   Log-Msg "Executing NSIS installer silently with auto-relaunch..."
+  $labelDesc.Text = "Extracting files and applying update... Please wait."
+  $form.Refresh()
   $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated", "--force-run" -PassThru -Wait
   Log-Msg "Installer process finished with exit code: $($p.ExitCode)"
 } else {
   Log-Msg "ERROR: Installer path not found: $InstallerPath"
 }
 
-# 5. Grace period before verifying relaunch
+# 6. Grace period before verifying relaunch
+$labelDesc.Text = "Relaunching FryFreeze POS..."
+$form.Refresh()
 Start-Sleep -Milliseconds 2500
 
-# 6. Fallback relaunch via Win32_Process (completely detached root process)
+# 7. Fallback relaunch via Win32_Process (completely detached root process)
 $running = Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue
 if (-not $running) {
   if (Test-Path -LiteralPath $AppExePath) {
@@ -613,7 +659,9 @@ if (-not $running) {
 } else {
   Log-Msg "FryFreeze already running via installer. PIDs: $($running.Id -join ', ')"
 }
+
 Log-Msg "=== Update runner finished ==="
+$form.Close()
 `;
 
     fs.writeFileSync(runnerScriptPath, runnerScriptContent.trim(), 'utf8');

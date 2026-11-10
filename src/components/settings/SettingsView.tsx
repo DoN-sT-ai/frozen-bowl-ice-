@@ -580,6 +580,24 @@ export const SettingsView: React.FC = () => {
 
   return (
     <div className="flex-1 flex flex-col h-full min-h-0 bg-neutral-50 overflow-y-auto">
+      {installingUpdate && (
+        <div className="fixed inset-0 z-[9999] bg-slate-950/85 backdrop-blur-sm flex items-center justify-center p-4 animate-in fade-in duration-200">
+          <div className="bg-slate-900 border border-slate-700/80 rounded-2xl p-6 max-w-md w-full shadow-2xl text-center space-y-4">
+            <div className="w-12 h-12 rounded-xl bg-blue-500/20 text-blue-400 flex items-center justify-center mx-auto border border-blue-500/30">
+              <RefreshCw className="w-6 h-6 animate-spin text-blue-400" />
+            </div>
+            <div>
+              <h3 className="text-base font-bold text-white">Applying FryFreeze Update...</h3>
+              <p className="text-xs text-slate-300 mt-1.5 leading-relaxed">
+                Saving local ledger state and launching the update runner.
+              </p>
+              <div className="text-[11px] text-blue-300 font-medium mt-3 bg-blue-950/60 py-2 px-3 rounded-lg border border-blue-800/40">
+                A progress window will guide the ~15s installation and relaunch FryFreeze automatically.
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div className="p-4 bg-white border-b border-neutral-200 shrink-0">
         <h1 className="text-base font-semibold text-neutral-900 leading-none flex items-center gap-2">
