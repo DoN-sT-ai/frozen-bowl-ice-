@@ -20,9 +20,21 @@ export const UpdateNotificationBanner: React.FC = () => {
     }
   }, [user]);
 
-  // Subscribe to Electron updater events
+  // Subscribe to Electron updater events and check initial pending state
   useEffect(() => {
     if (!window.electronAPI?.updater) return;
+
+    // Check if an update is already pending on disk from previous session
+    window.electronAPI.updater.getVersion().then((v) => {
+      if (v?.hasPendingUpdate) {
+        setStatusData({
+          status: 'downloaded',
+          version: v.pendingVersion,
+          message: v.pendingVersion ? `Update v${v.pendingVersion} ready to install!` : 'Update ready to install!',
+        });
+        setDismissed(false);
+      }
+    }).catch(() => {});
 
     const unsubStatus = window.electronAPI.updater.onStatus((data) => {
       setStatusData(data);
@@ -53,7 +65,14 @@ export const UpdateNotificationBanner: React.FC = () => {
   const handleInstallNow = async () => {
     if (!window.electronAPI?.updater?.install) return;
     setIsInstalling(true);
-    await window.electronAPI.updater.install();
+    try {
+      const res = await window.electronAPI.updater.install();
+      if (res && !res.success) {
+        setIsInstalling(false);
+      }
+    } catch (_) {
+      setIsInstalling(false);
+    }
   };
 
   return (

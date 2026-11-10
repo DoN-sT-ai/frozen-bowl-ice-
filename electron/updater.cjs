@@ -71,16 +71,57 @@ function sendToWindow(channel, data) {
   }
 }
 
-function isNewerVersion(remote, local) {
-  const r = (remote || '').split('.').map((n) => parseInt(n, 10) || 0);
-  const l = (local || '').split('.').map((n) => parseInt(n, 10) || 0);
+function parseVersion(filenameOrVersion) {
+  if (!filenameOrVersion) return '0.0.0';
+  const match = filenameOrVersion.match(/(\d+\.\d+\.\d+)/);
+  return match ? match[1] : filenameOrVersion;
+}
+
+function compareVersions(v1, v2) {
+  const r = (parseVersion(v1) || '').split('.').map((n) => parseInt(n, 10) || 0);
+  const l = (parseVersion(v2) || '').split('.').map((n) => parseInt(n, 10) || 0);
   for (let i = 0; i < Math.max(r.length, l.length); i++) {
     const rVal = r[i] || 0;
     const lVal = l[i] || 0;
-    if (rVal > lVal) return true;
-    if (rVal < lVal) return false;
+    if (rVal > lVal) return 1;
+    if (rVal < lVal) return -1;
   }
-  return false;
+  return 0;
+}
+
+function isNewerVersion(remote, local) {
+  return compareVersions(remote, local) > 0;
+}
+
+function pruneOldInstallers(updateDir, keepFilename = null) {
+  if (!fs.existsSync(updateDir)) return;
+  try {
+    const entries = fs.readdirSync(updateDir);
+    for (const entry of entries) {
+      if (keepFilename && entry === keepFilename) continue;
+      // Delete older or stale .exe or temporary download chunks
+      if (entry.endsWith('.exe') || entry.endsWith('.tmp') || entry.includes('.exe.part')) {
+        try {
+          fs.unlinkSync(path.join(updateDir, entry));
+          console.log(`[AutoUpdater] Pruned older/stale update artifact: ${entry}`);
+        } catch (e) {
+          console.warn(`[AutoUpdater] Could not prune ${entry}:`, e.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('[AutoUpdater] Prune check note:', err.message);
+  }
+}
+
+function getSortedPendingInstallers(updateDir) {
+  if (!fs.existsSync(updateDir)) return [];
+  try {
+    const files = fs.readdirSync(updateDir).filter((f) => f.endsWith('.exe') && !f.endsWith('.tmp'));
+    return files.sort((a, b) => compareVersions(parseVersion(b), parseVersion(a)));
+  } catch (_) {
+    return [];
+  }
 }
 
 // ─── Network Fetch & Stream Utilities with Auto-Retry ────────────────────────
@@ -208,6 +249,9 @@ async function downloadRelease(filename, version, expectedSha512, totalSize) {
       if (!fs.existsSync(updateDir)) {
         fs.mkdirSync(updateDir, { recursive: true });
       }
+
+      // Automatically prune older or conflicting installer artifacts
+      pruneOldInstallers(updateDir, filename);
 
       const destPath = path.join(updateDir, filename);
       const tempPath = `${destPath}.tmp`;
@@ -489,7 +533,7 @@ ipcMain.handle('updater:install', async () => {
 
     // Check if installer is already present on disk in pending-update
     if ((!installerPath || !fs.existsSync(installerPath)) && fs.existsSync(updateDir)) {
-      const exes = fs.readdirSync(updateDir).filter((f) => f.endsWith('.exe') && !f.endsWith('.tmp'));
+      const exes = getSortedPendingInstallers(updateDir);
       if (exes.length > 0) {
         installerPath = path.join(updateDir, exes[0]);
       }
@@ -511,10 +555,11 @@ ipcMain.handle('updater:install', async () => {
     const runnerScriptPath = path.join(updateDir, 'apply-update.ps1');
 
     // Dedicated PowerShell update runner:
-    // 1. Monitors current process PID and waits until FryFreeze.exe has completely terminated.
-    // 2. Waits an extra 600ms grace period so Windows fully clears all DLL & SQLite file locks.
-    // 3. Executes NSIS installer silently with /S and waits for it to complete.
-    // 4. Relaunches FryFreeze automatically.
+    // 1. Monitors current process PID and waits until calling process has terminated.
+    // 2. Kills any lingering FryFreeze child/auxiliary processes (GPU, renderers, crashpad) to release file locks.
+    // 3. Waits an extra 1000ms grace period so Windows fully clears all DLL & SQLite file locks.
+    // 4. Runs NSIS silently with /S and --updated (without prompting, in-place update).
+    // 5. Waits for installer to finish, then relaunches FryFreeze automatically.
     const runnerScriptContent = `
 param(
   [int]$TargetPid,
@@ -522,23 +567,52 @@ param(
   [string]$AppExePath
 )
 
+$LogFile = Join-Path (Split-Path $InstallerPath) "update.log"
+function Log-Msg($msg) {
+  "[{0:yyyy-MM-dd HH:mm:ss}] {1}" -f (Get-Date), $msg | Out-File -FilePath $LogFile -Append -Encoding utf8
+}
+
+Log-Msg "=== Update runner started ==="
+Log-Msg "TargetPid: $TargetPid"
+Log-Msg "InstallerPath: $InstallerPath"
+Log-Msg "AppExePath: $AppExePath"
+
+# 1. Wait for caller process to exit
 $waitCount = 0
 while ((Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) -and ($waitCount -lt 40)) {
   Start-Sleep -Milliseconds 250
   $waitCount++
 }
+Log-Msg "Target process $TargetPid exited (waited $($waitCount * 250)ms)"
 
-Start-Sleep -Milliseconds 600
+# 2. Terminate any lingering FryFreeze child/aux processes to clear DLL/EXE locks
+Log-Msg "Terminating lingering FryFreeze processes..."
+Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
+# 3. Grace period for Windows file locks
+Start-Sleep -Milliseconds 1000
+
+# 4. Run NSIS installer silently
 if (Test-Path -LiteralPath $InstallerPath) {
-  Start-Process -FilePath $InstallerPath -ArgumentList "/S" -Wait
+  Log-Msg "Executing NSIS installer silently..."
+  $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated" -PassThru -Wait
+  Log-Msg "Installer process finished with exit code: $($p.ExitCode)"
+} else {
+  Log-Msg "ERROR: Installer path not found: $InstallerPath"
 }
 
-Start-Sleep -Milliseconds 600
+# 5. Grace period before relaunching
+Start-Sleep -Milliseconds 1000
 
+# 6. Relaunch application
 if (Test-Path -LiteralPath $AppExePath) {
+  Log-Msg "Relaunching FryFreeze at: $AppExePath"
   Start-Process -FilePath $AppExePath
+  Log-Msg "Application launch command invoked"
+} else {
+  Log-Msg "ERROR: AppExePath not found: $AppExePath"
 }
+Log-Msg "=== Update runner finished ==="
 `;
 
     fs.writeFileSync(runnerScriptPath, runnerScriptContent.trim(), 'utf8');
@@ -586,9 +660,23 @@ if (Test-Path -LiteralPath $AppExePath) {
 ipcMain.handle('updater:get-version', () => {
   const updateDir = path.join(app.getPath('userData'), 'pending-update');
   let hasPending = Boolean(downloadedInstallerPath && fs.existsSync(downloadedInstallerPath));
+  let pendingVersion = null;
+
   if (!hasPending && fs.existsSync(updateDir)) {
-    const exes = fs.readdirSync(updateDir).filter((f) => f.endsWith('.exe') && !f.endsWith('.tmp'));
-    hasPending = exes.length > 0;
+    const exes = getSortedPendingInstallers(updateDir);
+    if (exes.length > 0) {
+      const bestExe = path.join(updateDir, exes[0]);
+      try {
+        const stat = fs.statSync(bestExe);
+        if (stat.size > 1000000) {
+          downloadedInstallerPath = bestExe;
+          hasPending = true;
+          pendingVersion = parseVersion(exes[0]);
+        }
+      } catch (_) {}
+    }
+  } else if (downloadedInstallerPath) {
+    pendingVersion = parseVersion(path.basename(downloadedInstallerPath));
   }
 
   return {
@@ -596,6 +684,7 @@ ipcMain.handle('updater:get-version', () => {
     isPackaged: app.isPackaged,
     feedUrl: getEdgeFunctionUrl(),
     hasPendingUpdate: hasPending,
+    pendingVersion: pendingVersion,
   };
 });
 

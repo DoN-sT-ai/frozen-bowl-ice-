@@ -193,7 +193,16 @@ export const SettingsView: React.FC = () => {
   useEffect(() => {
     if (window.electronAPI?.updater) {
       window.electronAPI.updater.getVersion().then((v) => {
-        if (v) setAppVersionInfo(v);
+        if (v) {
+          setAppVersionInfo(v);
+          if (v.hasPendingUpdate) {
+            setUpdaterStatus({
+              status: 'downloaded',
+              version: v.pendingVersion,
+              message: v.pendingVersion ? `Update v${v.pendingVersion} ready to install!` : 'Update ready to install!',
+            });
+          }
+        }
       }).catch(() => {});
 
       const unsubStatus = window.electronAPI.updater.onStatus((data) => {
@@ -237,7 +246,16 @@ export const SettingsView: React.FC = () => {
   const handleInstallDownloadedUpdate = async () => {
     if (!window.electronAPI?.updater?.install) return;
     setInstallingUpdate(true);
-    await window.electronAPI.updater.install();
+    try {
+      const res = await window.electronAPI.updater.install();
+      if (res && !res.success && res.error) {
+        setUpdaterStatus({ status: 'error', message: res.error });
+        setInstallingUpdate(false);
+      }
+    } catch (e: any) {
+      setUpdaterStatus({ status: 'error', message: e.message || 'Installation failed' });
+      setInstallingUpdate(false);
+    }
   };
 
   // Fetch connected printers

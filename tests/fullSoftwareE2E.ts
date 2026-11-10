@@ -377,6 +377,19 @@ async function runFullSoftwareAudit() {
     });
   } catch (_) {}
 
+  // Restore store name and prefix to default FryFreeze for test idempotency
+  try {
+    const { LocalDb } = await import('../server/localDb.ts');
+    const store = await LocalDb.getFirstStore();
+    if (store) {
+      await LocalDb.updateStore(store.id, {
+        name: 'FryFreeze',
+        code: 'FRYFREEZE-01',
+        invoice_prefix: 'FF',
+      });
+    }
+  } catch (_) {}
+
   console.log('\n=============================================================');
   console.log(`🏁 AUDIT COMPLETE: ${passed} / ${total} FUNCTIONAL TESTS PASSED!`);
   console.log('=============================================================\n');

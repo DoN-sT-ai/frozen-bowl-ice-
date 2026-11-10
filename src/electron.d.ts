@@ -23,7 +23,7 @@ export interface ElectronAPI {
   updater?: {
     check: () => Promise<{ success: boolean; updateInfo?: any; isDev?: boolean; error?: string; message?: string }>;
     install: () => Promise<{ success: boolean; error?: string }>;
-    getVersion: () => Promise<{ version: string; isPackaged: boolean; feedUrl?: string }>;
+    getVersion: () => Promise<{ version: string; isPackaged: boolean; feedUrl?: string; hasPendingUpdate?: boolean; pendingVersion?: string }>;
     setAuth: (token: string) => Promise<{ success: boolean }>;
     onStatus: (callback: (data: UpdateStatusData) => void) => () => void;
     onProgress: (callback: (data: UpdateProgressData) => void) => () => void;
