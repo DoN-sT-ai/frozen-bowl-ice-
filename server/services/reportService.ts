@@ -25,39 +25,108 @@ export class ReportService {
       sales = sales.filter(s => s.status === options.status);
     }
 
-    const reportRows = sales.map(s => {
+    // 1. Invoices (Positive immutable accounting records)
+    const invoiceRows = sales.map(s => {
       const items = db.sale_items.filter(si => si.sale_id === s.id);
       const cogs = round2(items.reduce((sum, i) => sum + (i.quantity * (i.purchase_price_snapshot || 0)), 0));
       return {
         id: s.id,
-        billNumber: s.bill_number,
+        recordType: 'INVOICE' as const,
+        voucherNumber: s.bill_number,
+        referenceInvoiceNumber: '-',
         date: s.created_at,
         cashier: s.employee_name,
-        subtotal: s.subtotal,
-        discount: s.discount,
-        tax: s.tax,
-        total: s.total,
+        customerName: s.customer_name || 'Walk-in Customer',
+        customerPhone: s.customer_phone || '',
+        subtotal: round2(s.subtotal),
+        discount: round2(s.discount),
+        tax: round2(s.tax),
+        total: round2(s.total),
+        amount: round2(s.total),
+        refundStatus: s.refund_status || 'NONE',
+        refundedAmount: s.refunded_amount || 0,
+        netTotal: round2(s.total), // Original invoice remains immutable per statutory law
+        lastCreditNoteNumber: s.last_credit_note_number,
         cogs,
         grossMargin: s.status === 'COMPLETED' ? round2(s.total - cogs) : 0,
         paymentMethod: s.payment_method,
         status: s.status,
+        notes: s.notes || '',
         itemCount: items.length,
+        billNumber: s.bill_number,
       };
     });
 
-    const totalRevenue = round2(reportRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.total, 0));
-    const totalTax = round2(reportRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.tax, 0));
-    const totalDiscount = round2(reportRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.discount, 0));
+    // 2. Credit Notes (Independent negative/credit deduction records)
+    let creditNotes = (db.credit_notes || []).filter(cn => cn.store_id === storeId);
+    if (options?.from) {
+      creditNotes = creditNotes.filter(cn => cn.created_at >= options.from!);
+    }
+    if (options?.to) {
+      creditNotes = creditNotes.filter(cn => cn.created_at <= options.to! + 'T23:59:59.999Z');
+    }
+
+    const creditNoteRows = creditNotes.map(cn => {
+      const taxAmount = round2(cn.refund_tax || 0);
+      const subtotalAmount = round2(cn.refund_amount - taxAmount);
+      return {
+        id: cn.id,
+        recordType: 'CREDIT_NOTE' as const,
+        voucherNumber: cn.credit_note_number,
+        referenceInvoiceNumber: cn.bill_number,
+        date: cn.created_at,
+        cashier: cn.created_by_name || 'Staff',
+        customerName: cn.customer_name || 'Walk-in Customer',
+        customerPhone: cn.customer_phone || '',
+        subtotal: -subtotalAmount,
+        discount: 0,
+        tax: -taxAmount,
+        total: -round2(cn.refund_amount),
+        amount: -round2(cn.refund_amount), // Negative credit entry in ledger
+        refundStatus: 'FULL',
+        refundedAmount: 0,
+        netTotal: -round2(cn.refund_amount),
+        lastCreditNoteNumber: cn.credit_note_number,
+        cogs: 0,
+        grossMargin: 0,
+        paymentMethod: cn.refund_method,
+        status: 'ISSUED',
+        notes: cn.reason || 'Customer Refund',
+        itemCount: (cn.items || []).length,
+        billNumber: cn.credit_note_number,
+      };
+    });
+
+    // Combined unified ledger (Chronological order)
+    const ledgerRows = [...invoiceRows, ...creditNoteRows].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
+
+    const totalGrossRevenue = round2(invoiceRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.total, 0));
+    const totalRefunds = round2(creditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
+    const netRevenue = round2(Math.max(0, totalGrossRevenue - totalRefunds));
+    const totalTax = round2(invoiceRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.tax, 0));
+    const totalRefundTax = round2(creditNotes.reduce((sum, cn) => sum + (cn.refund_tax || 0), 0));
+    const netTax = round2(Math.max(0, totalTax - totalRefundTax));
+    const totalDiscount = round2(invoiceRows.filter(r => r.status === 'COMPLETED').reduce((sum, r) => sum + r.discount, 0));
 
     return {
-      rows: reportRows,
+      rows: ledgerRows,
+      invoices: invoiceRows,
+      creditNotes,
       summary: {
-        totalRevenue,
-        totalTax,
+        totalRevenue: netRevenue,
+        grossRevenue: totalGrossRevenue,
+        totalRefunds,
+        netRevenue,
+        totalTax: netTax,
+        grossTax: totalTax,
         totalDiscount,
-        totalBills: reportRows.length,
-        completedBills: reportRows.filter(r => r.status === 'COMPLETED').length,
-        voidedBills: reportRows.filter(r => r.status === 'VOIDED').length,
+        totalBills: invoiceRows.length,
+        completedBills: invoiceRows.filter(r => r.status === 'COMPLETED').length,
+        refundedBills: invoiceRows.filter(r => r.refundStatus === 'PARTIAL' || r.refundStatus === 'FULL').length,
+        voidedBills: invoiceRows.filter(r => r.status === 'VOIDED').length,
+        creditNotesCount: creditNotes.length,
       },
     };
   }

@@ -103,34 +103,30 @@ function seedIceCreamParlourData(customDb) {
     `);
     try {
       sqlite.exec(`
-        DELETE FROM sale_items;
-        DELETE FROM sales;
-        DELETE FROM stock_movements;
-      `);
-    } catch (_) {
-    }
-    try {
-      sqlite.exec(`
-        DELETE FROM pos_refund_lines;
-        DELETE FROM pos_refunds;
         DELETE FROM pos_sale_item_modifiers;
         DELETE FROM pos_sale_items;
         DELETE FROM pos_payments;
+        DELETE FROM pos_refund_lines;
+        DELETE FROM pos_refunds;
         DELETE FROM pos_sales;
-        DELETE FROM purchase_lines;
-        DELETE FROM purchases;
+        DELETE FROM sale_items;
+        DELETE FROM sales;
         DELETE FROM stock_count_lines;
         DELETE FROM stock_counts;
         DELETE FROM wastage_records;
+        DELETE FROM purchase_lines;
+        DELETE FROM purchases;
+        DELETE FROM stock_movements;
         DELETE FROM inventory_movements;
         DELETE FROM inventory_lots;
-        DELETE FROM recipe_ingredients;
-        DELETE FROM recipe_versions;
-        DELETE FROM product_modifier_groups;
         DELETE FROM modifier_ingredients;
+        DELETE FROM recipe_ingredients;
+        DELETE FROM product_modifier_groups;
         DELETE FROM modifiers;
         DELETE FROM modifier_groups;
+        DELETE FROM recipe_versions;
         DELETE FROM bom_products;
+        DELETE FROM inventory_items;
         DELETE FROM products;
         DELETE FROM categories;
         DELETE FROM suppliers;
@@ -956,6 +952,27 @@ var init_localDb = __esm({
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS credit_notes (
+        id TEXT PRIMARY KEY,
+        credit_note_number TEXT NOT NULL UNIQUE,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+        bill_number TEXT NOT NULL,
+        customer_name TEXT,
+        customer_phone TEXT,
+        refund_amount REAL NOT NULL,
+        refund_tax REAL NOT NULL DEFAULT 0.00,
+        refund_method TEXT NOT NULL DEFAULT 'CASH',
+        reason TEXT NOT NULL,
+        restock_items INTEGER NOT NULL DEFAULT 1,
+        items_json TEXT NOT NULL,
+        created_by TEXT,
+        created_by_name TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_credit_notes_store ON credit_notes(store_id);
+      CREATE INDEX IF NOT EXISTS idx_credit_notes_sale ON credit_notes(sale_id);
       CREATE INDEX IF NOT EXISTS idx_cash_sessions_store_status ON cash_drawer_sessions(store_id, status);
       CREATE INDEX IF NOT EXISTS idx_cash_sessions_opened_at ON cash_drawer_sessions(opened_at);
       CREATE INDEX IF NOT EXISTS idx_cash_tx_session ON cash_drawer_transactions(session_id);
@@ -971,6 +988,22 @@ var init_localDb = __esm({
         }
         try {
           this.db.exec("ALTER TABLE products ADD COLUMN package_info TEXT DEFAULT ''");
+        } catch {
+        }
+        try {
+          this.db.exec("ALTER TABLE sales ADD COLUMN refund_status TEXT DEFAULT 'NONE'");
+        } catch {
+        }
+        try {
+          this.db.exec("ALTER TABLE sales ADD COLUMN refunded_amount REAL DEFAULT 0.00");
+        } catch {
+        }
+        try {
+          this.db.exec("ALTER TABLE sales ADD COLUMN last_credit_note_id TEXT");
+        } catch {
+        }
+        try {
+          this.db.exec("ALTER TABLE sales ADD COLUMN last_credit_note_number TEXT");
         } catch {
         }
         try {
@@ -1753,6 +1786,10 @@ var init_localDb = __esm({
           igst: s.igst != null ? Number(s.igst) : void 0,
           round_off: s.round_off != null ? Number(s.round_off) : void 0,
           total: Number(s.total) || 0,
+          refund_status: s.refund_status || "NONE",
+          refunded_amount: Number(s.refunded_amount) || 0,
+          last_credit_note_id: s.last_credit_note_id || void 0,
+          last_credit_note_number: s.last_credit_note_number || void 0,
           items: itemsBySaleId.get(s.id) || []
         }));
       }
@@ -1770,6 +1807,10 @@ var init_localDb = __esm({
           igst: saleRow.igst != null ? Number(saleRow.igst) : void 0,
           round_off: saleRow.round_off != null ? Number(saleRow.round_off) : void 0,
           total: Number(saleRow.total) || 0,
+          refund_status: saleRow.refund_status || "NONE",
+          refunded_amount: Number(saleRow.refunded_amount) || 0,
+          last_credit_note_id: saleRow.last_credit_note_id || void 0,
+          last_credit_note_number: saleRow.last_credit_note_number || void 0,
           items: itemsRows.map((item) => ({
             ...item,
             quantity: Number(item.quantity) || 0,
@@ -1807,6 +1848,10 @@ var init_localDb = __esm({
           igst: saleRow.igst != null ? Number(saleRow.igst) : void 0,
           round_off: saleRow.round_off != null ? Number(saleRow.round_off) : void 0,
           total: Number(saleRow.total) || 0,
+          refund_status: saleRow.refund_status || "NONE",
+          refunded_amount: Number(saleRow.refunded_amount) || 0,
+          last_credit_note_id: saleRow.last_credit_note_id || void 0,
+          last_credit_note_number: saleRow.last_credit_note_number || void 0,
           items: itemsRows.map((item) => ({
             ...item,
             quantity: Number(item.quantity) || 0,
@@ -1829,6 +1874,105 @@ var init_localDb = __esm({
             })() : void 0
           }))
         };
+      }
+      // CREDIT NOTES & CUSTOMER REFUNDS
+      static async createCreditNote(creditNote) {
+        const validStoreId = this.resolveValidStoreId(creditNote.store_id);
+        this.db.prepare(`
+      INSERT INTO credit_notes (
+        id, credit_note_number, store_id, sale_id, bill_number, customer_name,
+        customer_phone, refund_amount, refund_tax, refund_method, reason,
+        restock_items, items_json, created_by, created_by_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+          creditNote.id,
+          creditNote.credit_note_number,
+          validStoreId,
+          creditNote.sale_id,
+          creditNote.bill_number,
+          creditNote.customer_name || null,
+          creditNote.customer_phone || null,
+          creditNote.refund_amount,
+          creditNote.refund_tax || 0,
+          creditNote.refund_method,
+          creditNote.reason,
+          creditNote.restock_items ? 1 : 0,
+          JSON.stringify(creditNote.items),
+          creditNote.created_by || null,
+          creditNote.created_by_name || null,
+          creditNote.created_at
+        );
+        return creditNote;
+      }
+      static async getCreditNotes(storeId, saleIdOrLimit, limit = 200) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        let saleId = void 0;
+        let finalLimit = 200;
+        if (typeof saleIdOrLimit === "string" && saleIdOrLimit.trim()) {
+          saleId = saleIdOrLimit.trim();
+          finalLimit = limit;
+        } else if (typeof saleIdOrLimit === "number") {
+          finalLimit = saleIdOrLimit;
+        }
+        let query = "SELECT * FROM credit_notes WHERE store_id = ?";
+        const params = [validStoreId];
+        if (saleId) {
+          query += " AND sale_id = ?";
+          params.push(saleId);
+        }
+        query += " ORDER BY created_at DESC LIMIT ?";
+        params.push(finalLimit);
+        const rows = this.db.prepare(query).all(...params);
+        return rows.map((r) => ({
+          ...r,
+          refund_amount: Number(r.refund_amount) || 0,
+          refund_tax: Number(r.refund_tax) || 0,
+          restock_items: Boolean(r.restock_items),
+          items: r.items_json ? (() => {
+            try {
+              return JSON.parse(r.items_json);
+            } catch {
+              return [];
+            }
+          })() : []
+        }));
+      }
+      static async getCreditNoteById(id) {
+        const r = this.db.prepare("SELECT * FROM credit_notes WHERE id = ?").get(id);
+        if (!r) return null;
+        return {
+          ...r,
+          refund_amount: Number(r.refund_amount) || 0,
+          refund_tax: Number(r.refund_tax) || 0,
+          restock_items: Boolean(r.restock_items),
+          items: r.items_json ? (() => {
+            try {
+              return JSON.parse(r.items_json);
+            } catch {
+              return [];
+            }
+          })() : []
+        };
+      }
+      static getNextCreditNoteNumber(storeId) {
+        const validStoreId = this.resolveValidStoreId(storeId);
+        const year = (/* @__PURE__ */ new Date()).getFullYear();
+        const prefix = `CN-${year}-`;
+        const countRow = this.db.prepare(`
+      SELECT COUNT(*) as count FROM credit_notes WHERE store_id = ? AND credit_note_number LIKE ?
+    `).get(validStoreId, `${prefix}%`);
+        const nextSeq = (countRow?.count || 0) + 1;
+        return `${prefix}${String(nextSeq).padStart(4, "0")}`;
+      }
+      static async updateSaleRefundStatus(saleId, refundStatus, refundedAmount, creditNoteId, creditNoteNumber) {
+        this.db.prepare(`
+      UPDATE sales SET 
+        refund_status = ?,
+        refunded_amount = ?,
+        last_credit_note_id = ?,
+        last_credit_note_number = ?
+      WHERE id = ?
+    `).run(refundStatus, refundedAmount, creditNoteId, creditNoteNumber, saleId);
       }
       static async getCustomerByPhone(storeId, phone) {
         const validStoreId = this.resolveValidStoreId(storeId);
@@ -2907,7 +3051,8 @@ var init_db = __esm({
           sale_items: [],
           expenses: [],
           audit_logs: [],
-          bill_sequences: []
+          bill_sequences: [],
+          credit_notes: []
         };
         this.initialized = false;
         this.initPromise = null;
@@ -2955,7 +3100,8 @@ var init_db = __esm({
             stock_movements,
             sales,
             expenses,
-            audit_logs
+            audit_logs,
+            credit_notes
           ] = await Promise.all([
             LocalDb.getUsers(storeId),
             LocalDb.getCategories(storeId),
@@ -2963,7 +3109,8 @@ var init_db = __esm({
             LocalDb.getStockMovements(storeId, 500),
             LocalDb.getSales(storeId, 500),
             LocalDb.getExpenses(storeId),
-            LocalDb.getAuditLogs(storeId, 500)
+            LocalDb.getAuditLogs(storeId, 500),
+            LocalDb.getCreditNotes(storeId)
           ]);
           this.cache.users = users;
           this.cache.categories = categories;
@@ -2972,6 +3119,7 @@ var init_db = __esm({
           this.cache.sales = sales;
           this.cache.expenses = expenses;
           this.cache.audit_logs = audit_logs;
+          this.cache.credit_notes = credit_notes;
           const saleItems = [];
           sales.forEach((s) => {
             if (s.items && Array.isArray(s.items)) {
@@ -3017,6 +3165,9 @@ var init_db = __esm({
       }
       get bill_sequences() {
         return this.cache.bill_sequences;
+      }
+      get credit_notes() {
+        return this.cache.credit_notes || [];
       }
       // Sequential bill number using atomic SQLite counter
       async getNextBillNumberAsync(storeId) {
@@ -3378,12 +3529,12 @@ var SupabaseDb = class {
       if (!uErr && Array.isArray(users)) {
         const storeMap = /* @__PURE__ */ new Map();
         for (const u of users) {
-          const key = u.store_name || u.store_id || "Frozen Bowl";
+          const key = u.store_name || u.store_id || "FryFreeze";
           if (!storeMap.has(key)) {
             const isStopped = u.store_active === false || ["STOPPED", "INACTIVE", "BLOCKED", "SUSPENDED"].includes(String(u.store_status || "").toUpperCase());
             storeMap.set(key, {
               id: u.store_id || key,
-              name: u.store_name || (u.store_id === "STORE-01" ? "Frozen Bowl" : key),
+              name: u.store_name || (u.store_id === "STORE-01" ? "FryFreeze" : key),
               code: (u.store_name || key).toUpperCase().replace(/\s+/g, "-").slice(0, 10),
               active: !isStopped,
               status: isStopped ? "STOPPED" : "ACTIVE",
@@ -3828,7 +3979,7 @@ var AuthService = class {
     if (!session) return null;
     const store = db.stores.find((s) => s.id === session.storeId) || db.stores[0] || {
       id: session.storeId,
-      name: "Frozen Bowl Ice Cream",
+      name: "FryFreeze",
       code: "STORE-01",
       currency: "INR",
       invoice_prefix: "BILL-"
@@ -4699,7 +4850,7 @@ var EmployeeService = class {
       throw new Error(`Username "${rawUsername}" is already taken in the cloud database`);
     }
     const currentStore = await LocalDb.getStore(storeId) || await LocalDb.getFirstStore();
-    const storeName = currentStore?.name || "Frozen Bowl";
+    const storeName = currentStore?.name || "FryFreeze";
     const saved = await SupabaseDb.createUser(newEmp, storeName);
     AuditService.log({
       storeId,
@@ -5166,6 +5317,37 @@ var CashControlService = class {
     }
   }
   /**
+   * Record a CASH refund / Credit Note payout in the active drawer session.
+   */
+  static async recordRefundIfSessionOpen(storeId, creditNote, userId, userName) {
+    if (creditNote.refund_method !== "CASH") return;
+    try {
+      const session = await LocalDb.getActiveCashDrawerSession(storeId);
+      if (!session) return;
+      const refundAmount = Number(creditNote.refund_amount) || 0;
+      const newCashSales = Number((Number(session.cash_sales_amount || 0) - refundAmount).toFixed(2));
+      const newExpected = Number((Number(session.expected_amount || 0) - refundAmount).toFixed(2));
+      await LocalDb.updateCashDrawerSession(session.id, {
+        cash_sales_amount: newCashSales,
+        expected_amount: newExpected
+      });
+      await LocalDb.createCashDrawerTransaction({
+        session_id: session.id,
+        store_id: storeId,
+        type: "REFUND",
+        amount: -refundAmount,
+        category: "Cash Refund",
+        reason: `Credit Note #${creditNote.credit_note_number} (Bill #${creditNote.bill_number}): ${creditNote.reason || "Customer refund"}`,
+        reference_id: creditNote.id,
+        performed_by: userId,
+        performed_by_name: userName || "Cashier",
+        notes: `Credit Note #${creditNote.credit_note_number}`
+      });
+    } catch (err) {
+      console.error("[CashControl] Error recording credit note cash refund to drawer session:", err);
+    }
+  }
+  /**
    * End shift and close the cash drawer with actual physical denomination count.
    */
   static async closeSession(storeId, userId, userName, payload) {
@@ -5501,6 +5683,8 @@ var BillingService = class {
       total: roundedTotal,
       payment_method: payload.paymentMethod,
       status: "COMPLETED",
+      refund_status: "NONE",
+      refunded_amount: 0,
       notes: payload.notes?.trim() || void 0,
       created_at: now,
       items: saleItems
@@ -5674,6 +5858,188 @@ var BillingService = class {
     const items = db.sale_items.filter((si) => si.sale_id === sale.id);
     return { ...sale, items };
   }
+  // ============================================================
+  // CUSTOMER REFUND & CREDIT NOTE ENGINE
+  // ============================================================
+  static async createCreditNote(params) {
+    const { storeId, userId, userName, saleId, items: requestedItems, refundMethod, reason, restockAll } = params;
+    if (!reason || !reason.trim()) {
+      throw new Error("A reason is mandatory for issuing a credit note");
+    }
+    if (!requestedItems || requestedItems.length === 0) {
+      throw new Error("At least one item must be selected for refund");
+    }
+    let sale = db.sales.find((s) => s.id === saleId && s.store_id === storeId);
+    if (!sale) {
+      const row = await LocalDb.getSaleById(saleId);
+      if (row && row.store_id === storeId) {
+        sale = row;
+      }
+    }
+    if (!sale) throw new Error("Original sale invoice not found");
+    if (sale.status === "VOIDED") throw new Error("Cannot refund a voided bill");
+    const saleItems = db.sale_items && db.sale_items.filter((si) => si.sale_id === sale.id).length > 0 ? db.sale_items.filter((si) => si.sale_id === sale.id) : sale.items || [];
+    const now = (/* @__PURE__ */ new Date()).toISOString();
+    const creditNoteId = crypto10.randomUUID();
+    const creditNoteNumber = LocalDb.getNextCreditNoteNumber(storeId);
+    const existingCreditNotes = await LocalDb.getCreditNotes(storeId, sale.id);
+    const alreadyRefundedByItem = /* @__PURE__ */ new Map();
+    for (const cn of existingCreditNotes) {
+      for (const it of cn.items || []) {
+        const prev = alreadyRefundedByItem.get(it.sale_item_id) || 0;
+        alreadyRefundedByItem.set(it.sale_item_id, prev + (Number(it.quantity_refunded) || 0));
+      }
+    }
+    let totalRefundAmount = 0;
+    let totalRefundTax = 0;
+    const creditNoteItems = [];
+    for (const reqItem of requestedItems) {
+      const originalItem = saleItems.find((si) => si.id === reqItem.saleItemId);
+      if (!originalItem) {
+        throw new Error(`Item ${reqItem.saleItemId} not found in original sale`);
+      }
+      const qtyRefund = Number(reqItem.quantityRefunded !== void 0 ? reqItem.quantityRefunded : reqItem.quantity);
+      if (isNaN(qtyRefund) || qtyRefund <= 0) {
+        throw new Error(`Invalid refund quantity for item ${originalItem.product_name_snapshot}`);
+      }
+      const prevRefunded = alreadyRefundedByItem.get(originalItem.id) || 0;
+      const remainingQty = originalItem.quantity - prevRefunded;
+      if (remainingQty <= 0) {
+        throw new Error(`Item ${originalItem.product_name_snapshot} is already fully refunded`);
+      }
+      if (qtyRefund > remainingQty) {
+        throw new Error(`Refund quantity (${qtyRefund}) cannot exceed remaining refundable quantity (${remainingQty}) for ${originalItem.product_name_snapshot}`);
+      }
+      const unitTotal = originalItem.line_total / originalItem.quantity;
+      const unitTax = (originalItem.tax_amount || 0) / originalItem.quantity;
+      const lineRefund = Number((unitTotal * qtyRefund).toFixed(2));
+      const lineTaxRefund = Number((unitTax * qtyRefund).toFixed(2));
+      totalRefundAmount = Number((totalRefundAmount + lineRefund).toFixed(2));
+      totalRefundTax = Number((totalRefundTax + lineTaxRefund).toFixed(2));
+      const shouldRestock = restockAll !== void 0 ? Boolean(restockAll) : Boolean(reqItem.restock);
+      creditNoteItems.push({
+        sale_item_id: originalItem.id,
+        product_id: originalItem.product_id,
+        product_name: originalItem.product_name_snapshot,
+        quantity_refunded: qtyRefund,
+        unit_price: originalItem.unit_price,
+        tax_rate: originalItem.tax_rate,
+        tax_amount: lineTaxRefund,
+        refund_amount: lineRefund,
+        restocked: shouldRestock
+      });
+      if (shouldRestock) {
+        const product = db.products.find((p) => p.id === originalItem.product_id && p.store_id === storeId);
+        if (product) {
+          const beforeStock = product.current_stock;
+          const afterStock = beforeStock + qtyRefund;
+          product.current_stock = afterStock;
+          product.updated_at = now;
+          const restockMov = {
+            id: crypto10.randomUUID(),
+            store_id: storeId,
+            product_id: product.id,
+            product_name: product.name,
+            user_id: userId,
+            user_name: userName,
+            type: "RESTOCK",
+            quantity: qtyRefund,
+            before_stock: beforeStock,
+            after_stock: afterStock,
+            reason: `Restocked via Credit Note #${creditNoteNumber} (Bill #${sale.bill_number}): ${reason.trim()}`,
+            reference_type: "CREDIT_NOTE",
+            reference_id: creditNoteId,
+            created_at: now
+          };
+          await LocalDb.createStockMovement(restockMov).catch(() => {
+          });
+          await LocalDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {
+          });
+          db.stock_movements.unshift(restockMov);
+        }
+      }
+    }
+    const previouslyRefunded = Number(sale.refunded_amount || 0);
+    const newTotalRefunded = Number((previouslyRefunded + totalRefundAmount).toFixed(2));
+    const isFullRefund = newTotalRefunded >= Number(sale.total) - 0.01;
+    const refundStatus = isFullRefund ? "FULL" : "PARTIAL";
+    const creditNoteRecord = {
+      id: creditNoteId,
+      credit_note_number: creditNoteNumber,
+      store_id: storeId,
+      sale_id: sale.id,
+      bill_number: sale.bill_number,
+      customer_name: sale.customer_name,
+      customer_phone: sale.customer_phone,
+      refund_amount: totalRefundAmount,
+      refund_tax: totalRefundTax,
+      refund_method: refundMethod || "CASH",
+      reason: reason.trim(),
+      restock_items: creditNoteItems.some((i) => i.restocked),
+      items: creditNoteItems,
+      created_by: userId,
+      created_by_name: userName,
+      created_at: now
+    };
+    await LocalDb.createCreditNote(creditNoteRecord);
+    await LocalDb.updateSaleRefundStatus(sale.id, refundStatus, newTotalRefunded, creditNoteId, creditNoteNumber);
+    if (!db.credit_notes) db.cache.credit_notes = [];
+    db.credit_notes.unshift(creditNoteRecord);
+    sale.refund_status = refundStatus;
+    sale.refunded_amount = newTotalRefunded;
+    sale.last_credit_note_id = creditNoteId;
+    sale.last_credit_note_number = creditNoteNumber;
+    if (refundMethod === "CASH") {
+      await CashControlService.recordRefundIfSessionOpen(storeId, creditNoteRecord, userId, userName);
+    }
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: "CREDIT_NOTE_CREATED",
+      entityType: "CREDIT_NOTE",
+      entityId: creditNoteId,
+      afterData: {
+        creditNoteNumber,
+        billNumber: sale.bill_number,
+        refundAmount: totalRefundAmount,
+        refundMethod,
+        reason: reason.trim(),
+        refundStatus
+      }
+    });
+    return { creditNote: creditNoteRecord, sale };
+  }
+  static async getCreditNotes(storeId, options) {
+    let list = await LocalDb.getCreditNotes(storeId, 1e3);
+    if (!list || list.length === 0) {
+      list = db.credit_notes.filter((cn) => cn.store_id === storeId);
+    } else {
+      db.cache.credit_notes = list;
+    }
+    if (options?.search) {
+      const q = options.search.trim().toLowerCase();
+      list = list.filter(
+        (cn) => cn.credit_note_number.toLowerCase().includes(q) || cn.bill_number.toLowerCase().includes(q) || cn.customer_name && cn.customer_name.toLowerCase().includes(q) || cn.customer_phone && cn.customer_phone.includes(q)
+      );
+    }
+    if (options?.from) {
+      const fromDate = new Date(options.from).getTime();
+      list = list.filter((cn) => new Date(cn.created_at).getTime() >= fromDate);
+    }
+    if (options?.to) {
+      const toDate = new Date(options.to).getTime() + 864e5;
+      list = list.filter((cn) => new Date(cn.created_at).getTime() <= toDate);
+    }
+    return list;
+  }
+  static async getCreditNoteById(storeId, id) {
+    let cn = db.credit_notes.find((c) => c.id === id && c.store_id === storeId);
+    if (!cn) {
+      cn = await LocalDb.getCreditNoteById(id);
+    }
+    return cn;
+  }
 };
 
 // server/services/verificationService.ts
@@ -5755,8 +6121,12 @@ var DashboardService = class {
     const validSaleIds = new Set(validSales.map((s) => s.id));
     const validSaleItems = db.sale_items.filter((si) => validSaleIds.has(si.sale_id));
     const saleDateMap = new Map(validSales.map((s) => [s.id, s.created_at]));
+    const creditNotes = (db.credit_notes || []).filter((cn) => cn.store_id === storeId);
+    const todayCreditNotes = creditNotes.filter((cn) => cn.created_at.startsWith(todayStr));
+    const todayRefunds = round22(todayCreditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
     const todaySalesList = validSales.filter((s) => s.created_at.startsWith(todayStr));
-    const todayRevenue = round22(todaySalesList.reduce((sum, s) => sum + s.total, 0));
+    const todayGrossRevenue = round22(todaySalesList.reduce((sum, s) => sum + s.total, 0));
+    const todayRevenue = round22(Math.max(0, todayGrossRevenue - todayRefunds));
     const todayBillsCount = todaySalesList.length;
     const todaySaleItemIds = new Set(todaySalesList.map((s) => s.id));
     const todayItems = validSaleItems.filter((si) => todaySaleItemIds.has(si.sale_id));
@@ -5766,8 +6136,11 @@ var DashboardService = class {
     const todayExpensesList = activeExpenses.filter((e) => e.expense_date === todayStr);
     const todayExpenses = round22(todayExpensesList.reduce((sum, e) => sum + e.amount, 0));
     const todayNetProfit = round22(todayGrossProfit - todayExpenses);
+    const monthCreditNotes = creditNotes.filter((cn) => cn.created_at.startsWith(currentMonthStr));
+    const monthRefunds = round22(monthCreditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
     const monthSalesList = validSales.filter((s) => s.created_at.startsWith(currentMonthStr));
-    const monthRevenue = round22(monthSalesList.reduce((sum, s) => sum + s.total, 0));
+    const monthGrossRevenue = round22(monthSalesList.reduce((sum, s) => sum + s.total, 0));
+    const monthRevenue = round22(Math.max(0, monthGrossRevenue - monthRefunds));
     const monthSaleIds = new Set(monthSalesList.map((s) => s.id));
     const monthItems = validSaleItems.filter((si) => monthSaleIds.has(si.sale_id));
     const monthCOGS = round22(monthItems.reduce((sum, i) => sum + i.quantity * (i.purchase_price_snapshot || 0), 0));
@@ -5890,37 +6263,102 @@ var ReportService = class {
     if (options?.status) {
       sales = sales.filter((s) => s.status === options.status);
     }
-    const reportRows = sales.map((s) => {
+    const invoiceRows = sales.map((s) => {
       const items = db.sale_items.filter((si) => si.sale_id === s.id);
       const cogs = round23(items.reduce((sum, i) => sum + i.quantity * (i.purchase_price_snapshot || 0), 0));
       return {
         id: s.id,
-        billNumber: s.bill_number,
+        recordType: "INVOICE",
+        voucherNumber: s.bill_number,
+        referenceInvoiceNumber: "-",
         date: s.created_at,
         cashier: s.employee_name,
-        subtotal: s.subtotal,
-        discount: s.discount,
-        tax: s.tax,
-        total: s.total,
+        customerName: s.customer_name || "Walk-in Customer",
+        customerPhone: s.customer_phone || "",
+        subtotal: round23(s.subtotal),
+        discount: round23(s.discount),
+        tax: round23(s.tax),
+        total: round23(s.total),
+        amount: round23(s.total),
+        refundStatus: s.refund_status || "NONE",
+        refundedAmount: s.refunded_amount || 0,
+        netTotal: round23(s.total),
+        // Original invoice remains immutable per statutory law
+        lastCreditNoteNumber: s.last_credit_note_number,
         cogs,
         grossMargin: s.status === "COMPLETED" ? round23(s.total - cogs) : 0,
         paymentMethod: s.payment_method,
         status: s.status,
-        itemCount: items.length
+        notes: s.notes || "",
+        itemCount: items.length,
+        billNumber: s.bill_number
       };
     });
-    const totalRevenue = round23(reportRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.total, 0));
-    const totalTax = round23(reportRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.tax, 0));
-    const totalDiscount = round23(reportRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.discount, 0));
+    let creditNotes = (db.credit_notes || []).filter((cn) => cn.store_id === storeId);
+    if (options?.from) {
+      creditNotes = creditNotes.filter((cn) => cn.created_at >= options.from);
+    }
+    if (options?.to) {
+      creditNotes = creditNotes.filter((cn) => cn.created_at <= options.to + "T23:59:59.999Z");
+    }
+    const creditNoteRows = creditNotes.map((cn) => {
+      const taxAmount = round23(cn.refund_tax || 0);
+      const subtotalAmount = round23(cn.refund_amount - taxAmount);
+      return {
+        id: cn.id,
+        recordType: "CREDIT_NOTE",
+        voucherNumber: cn.credit_note_number,
+        referenceInvoiceNumber: cn.bill_number,
+        date: cn.created_at,
+        cashier: cn.created_by_name || "Staff",
+        customerName: cn.customer_name || "Walk-in Customer",
+        customerPhone: cn.customer_phone || "",
+        subtotal: -subtotalAmount,
+        discount: 0,
+        tax: -taxAmount,
+        total: -round23(cn.refund_amount),
+        amount: -round23(cn.refund_amount),
+        // Negative credit entry in ledger
+        refundStatus: "FULL",
+        refundedAmount: 0,
+        netTotal: -round23(cn.refund_amount),
+        lastCreditNoteNumber: cn.credit_note_number,
+        cogs: 0,
+        grossMargin: 0,
+        paymentMethod: cn.refund_method,
+        status: "ISSUED",
+        notes: cn.reason || "Customer Refund",
+        itemCount: (cn.items || []).length,
+        billNumber: cn.credit_note_number
+      };
+    });
+    const ledgerRows = [...invoiceRows, ...creditNoteRows].sort(
+      (a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()
+    );
+    const totalGrossRevenue = round23(invoiceRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.total, 0));
+    const totalRefunds = round23(creditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
+    const netRevenue = round23(Math.max(0, totalGrossRevenue - totalRefunds));
+    const totalTax = round23(invoiceRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.tax, 0));
+    const totalRefundTax = round23(creditNotes.reduce((sum, cn) => sum + (cn.refund_tax || 0), 0));
+    const netTax = round23(Math.max(0, totalTax - totalRefundTax));
+    const totalDiscount = round23(invoiceRows.filter((r) => r.status === "COMPLETED").reduce((sum, r) => sum + r.discount, 0));
     return {
-      rows: reportRows,
+      rows: ledgerRows,
+      invoices: invoiceRows,
+      creditNotes,
       summary: {
-        totalRevenue,
-        totalTax,
+        totalRevenue: netRevenue,
+        grossRevenue: totalGrossRevenue,
+        totalRefunds,
+        netRevenue,
+        totalTax: netTax,
+        grossTax: totalTax,
         totalDiscount,
-        totalBills: reportRows.length,
-        completedBills: reportRows.filter((r) => r.status === "COMPLETED").length,
-        voidedBills: reportRows.filter((r) => r.status === "VOIDED").length
+        totalBills: invoiceRows.length,
+        completedBills: invoiceRows.filter((r) => r.status === "COMPLETED").length,
+        refundedBills: invoiceRows.filter((r) => r.refundStatus === "PARTIAL" || r.refundStatus === "FULL").length,
+        voidedBills: invoiceRows.filter((r) => r.status === "VOIDED").length,
+        creditNotesCount: creditNotes.length
       }
     };
   }
@@ -8028,6 +8466,44 @@ app.post("/api/sales/:id/void", requireAuth, requireAdmin, async (req, res) => {
     res.json(voided);
   } catch (err) {
     res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.post("/api/sales/:id/refund", requireAuth, async (req, res) => {
+  try {
+    const { items, refundMethod, reason, restockAll } = req.body;
+    const result = await BillingService.createCreditNote({
+      storeId: req.user.store_id,
+      userId: req.user.id,
+      userName: req.user.name,
+      saleId: req.params.id,
+      items: items || [],
+      refundMethod: refundMethod || "CASH",
+      reason: reason || "Customer requested refund",
+      restockAll
+    });
+    res.json({ success: true, ...result });
+  } catch (err) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/credit-notes", requireAuth, async (req, res) => {
+  try {
+    const { search, from, to } = req.query;
+    const list = await BillingService.getCreditNotes(req.user.store_id, { search, from, to });
+    res.json(list);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+app.get("/api/credit-notes/:id", requireAuth, async (req, res) => {
+  try {
+    const note = await BillingService.getCreditNoteById(req.user.store_id, req.params.id);
+    if (!note) {
+      return res.status(404).json({ error: { message: "Credit note not found" } });
+    }
+    res.json(note);
+  } catch (err) {
+    res.status(500).json({ error: { message: err.message } });
   }
 });
 app.delete("/api/sales/purge-all", requireAuth, requireAdmin, async (req, res) => {

@@ -172,6 +172,10 @@ export interface Sale {
   total: number;
   payment_method: 'CASH' | 'UPI' | 'CARD' | 'OTHER';
   status: 'COMPLETED' | 'VOIDED' | 'REFUNDED';
+  refund_status?: 'NONE' | 'PARTIAL' | 'FULL';
+  refunded_amount?: number;
+  last_credit_note_id?: string;
+  last_credit_note_number?: string;
   notes?: string;
   created_at: string;
   voided_at?: string;
@@ -179,6 +183,55 @@ export interface Sale {
   voided_by_name?: string;
   void_reason?: string;
   items?: SaleItem[];
+}
+
+export interface CreditNoteItem {
+  sale_item_id: string;
+  product_id: string;
+  product_name: string;
+  quantity_refunded: number;
+  unit_price: number;
+  tax_rate: number;
+  tax_amount: number;
+  refund_amount: number;
+  restocked: boolean;
+}
+
+export interface CreditNote {
+  id: string;
+  credit_note_number: string;
+  store_id: string;
+  sale_id: string;
+  bill_number: string;
+  customer_name?: string;
+  customer_phone?: string;
+  refund_amount: number;
+  refund_tax: number;
+  refund_method: 'CASH' | 'UPI' | 'CARD' | 'STORE_CREDIT';
+  reason: string;
+  restock_items: boolean;
+  items: CreditNoteItem[];
+  created_by?: string;
+  created_by_name?: string;
+  created_at: string;
+}
+
+export interface HeldBill {
+  id: string;
+  heldAt: string;
+  label?: string;
+  customerName?: string;
+  customerPhone?: string;
+  customerGstin?: string;
+  items: CartItem[];
+  discount: number;
+  paymentMethod: 'CASH' | 'UPI' | 'CARD' | 'OTHER';
+  customerNotes?: string;
+  gstType: 'INTRA_STATE' | 'INTER_STATE' | 'EXEMPT';
+  sellingTaxMode: 'INCLUSIVE' | 'EXCLUSIVE' | 'AUTO';
+  total: number;
+  subtotal: number;
+  tax: number;
 }
 
 export interface Expense {

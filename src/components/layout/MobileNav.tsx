@@ -11,10 +11,10 @@ interface MobileNavProps {
 export const MobileNav: React.FC<MobileNavProps> = ({ currentTab, onSelectTab, onOpenMore }) => {
   const { user, isAdmin } = useAuth();
   const allowedTabIds = isAdmin
-    ? ['billing', 'cash_control', 'inventory', 'sales', 'movements', 'customers']
+    ? ['billing', 'cash_control', 'inventory', 'sales', 'refunds', 'movements', 'customers']
     : user?.permissions && user.permissions.length > 0
     ? user.permissions
-    : ['billing', 'inventory', 'sales', 'movements', 'cash_control', 'customers'];
+    : ['billing', 'inventory', 'sales', 'refunds', 'movements', 'cash_control', 'customers'];
 
   return (
     <nav className="md:hidden fixed bottom-0 left-0 right-0 h-14 bg-white border-t border-neutral-200 flex items-center justify-around px-2 z-40">

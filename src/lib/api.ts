@@ -17,6 +17,7 @@ import {
   CustomerSuggestion,
   CustomerAnalyticsResponse,
   CustomerHistoryResponse,
+  CreditNote,
 } from '../types';
 
 class ApiClient {
@@ -239,6 +240,7 @@ class ApiClient {
     employeeId?: string;
     paymentMethod?: string;
     status?: string;
+    limit?: number;
   }) {
     const query = new URLSearchParams();
     if (params?.search) query.set('search', params.search);
@@ -247,6 +249,7 @@ class ApiClient {
     if (params?.employeeId) query.set('employeeId', params.employeeId);
     if (params?.paymentMethod) query.set('paymentMethod', params.paymentMethod);
     if (params?.status) query.set('status', params.status);
+    if (params?.limit) query.set('limit', String(params.limit));
     return this.request<Sale[]>(`/api/sales?${query.toString()}`);
   }
 
@@ -259,6 +262,38 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify({ reason }),
     });
+  }
+
+  async refundSale(saleId: string, payload: {
+    items: Array<{
+      saleItemId: string;
+      productId: string;
+      quantityRefunded: number;
+      restock: boolean;
+    }>;
+    refundMethod: 'CASH' | 'UPI' | 'CARD' | 'STORE_CREDIT';
+    reason: string;
+    restockAll?: boolean;
+  }) {
+    return this.request<{ success: boolean; creditNote: CreditNote; sale: Sale }>(
+      `/api/sales/${saleId}/refund`,
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
+  }
+
+  async getCreditNotes(params?: { search?: string; from?: string; to?: string }) {
+    const query = new URLSearchParams();
+    if (params?.search) query.set('search', params.search);
+    if (params?.from) query.set('from', params.from);
+    if (params?.to) query.set('to', params.to);
+    return this.request<CreditNote[]>(`/api/credit-notes?${query.toString()}`);
+  }
+
+  async getCreditNoteById(id: string) {
+    return this.request<CreditNote>(`/api/credit-notes/${id}`);
   }
 
   async purgeAllSales() {

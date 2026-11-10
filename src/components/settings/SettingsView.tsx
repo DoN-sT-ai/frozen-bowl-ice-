@@ -92,7 +92,7 @@ export const SettingsView: React.FC = () => {
 
   // Wireless Updates State
   const [appVersionInfo, setAppVersionInfo] = useState<{ version: string; isPackaged: boolean; feedUrl?: string }>({
-    version: '2.1.5',
+    version: '2.1.6',
     isPackaged: false,
   });
   const [updaterStatus, setUpdaterStatus] = useState<UpdateStatusData | null>(null);
@@ -113,6 +113,7 @@ export const SettingsView: React.FC = () => {
     { id: 'inventory', label: 'Inventory & BOM', desc: 'Catalog products, recipes and ingredient stock', icon: Boxes },
     { id: 'movements', label: 'Stock Movements', desc: 'Stock in/out, purchase receipts and wastage logs', icon: ArrowLeftRight },
     { id: 'sales', label: 'Sales & Bills History', desc: 'Past sales receipts, reprinting and order history', icon: Receipt },
+    { id: 'refunds', label: 'Customer Refunds', desc: 'Item-level return processing, credit note generation and refunds ledger', icon: RotateCcw },
     { id: 'cash_control', label: 'Cash Control (Drawer)', desc: 'Register cash float, counter expenses & shift reconciliation', icon: Banknote },
     { id: 'customers', label: 'Customers & Loyalty', desc: 'Customer directory, visit count, weekly reports & history', icon: UserCheck },
     { id: 'expenses', label: 'Store Expenses', desc: 'Store expenditure ledger and payments management', icon: Wallet },
@@ -1102,7 +1103,7 @@ export const SettingsView: React.FC = () => {
                     </label>
                     <input
                       type="text"
-                      placeholder={`Default: ${store?.name || 'Frozen Bowl'}`}
+                      placeholder={`Default: ${store?.name || 'FryFreeze'}`}
                       value={printerSettings.headerStoreNameOverride}
                       onChange={(e) => handlePrinterSettingChange('headerStoreNameOverride', e.target.value)}
                       className="w-full px-2.5 py-1.5 border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none bg-white text-xs"
@@ -1385,7 +1386,7 @@ export const SettingsView: React.FC = () => {
                     </label>
                     <textarea
                       rows={2}
-                      placeholder="e.g. Goods once sold cannot be returned. Follow us on Instagram: @frozonbowl"
+                      placeholder="e.g. Goods once sold cannot be returned. Follow us on Instagram: @storename"
                       value={printerSettings.footerSecondaryNote}
                       onChange={(e) => handlePrinterSettingChange('footerSecondaryNote', e.target.value)}
                       className="w-full px-2.5 py-1.5 border border-neutral-300 rounded focus:border-neutral-900 focus:outline-none bg-white text-xs"
@@ -1522,7 +1523,7 @@ export const SettingsView: React.FC = () => {
                   <span className="text-[10.5px] text-neutral-400 font-mono uppercase">Quick Presets:</span>
                   <button
                     type="button"
-                    onClick={() => applyPermissionPreset(['billing', 'cash_control', 'sales'])}
+                    onClick={() => applyPermissionPreset(['billing', 'cash_control', 'sales', 'refunds', 'customers'])}
                     className="px-2 py-1 bg-white hover:bg-neutral-100 text-neutral-700 rounded border border-neutral-200 text-[11px] font-medium transition-colors"
                   >
                     Cashier Terminal
@@ -1536,7 +1537,7 @@ export const SettingsView: React.FC = () => {
                   </button>
                   <button
                     type="button"
-                    onClick={() => applyPermissionPreset(['billing', 'inventory', 'movements', 'sales', 'cash_control', 'expenses'])}
+                    onClick={() => applyPermissionPreset(['billing', 'inventory', 'movements', 'sales', 'refunds', 'cash_control', 'expenses', 'customers', 'reports', 'dashboard'])}
                     className="px-2 py-1 bg-white hover:bg-neutral-100 text-neutral-700 rounded border border-neutral-200 text-[11px] font-medium transition-colors"
                   >
                     Store Manager

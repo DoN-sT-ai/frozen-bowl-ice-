@@ -15,6 +15,7 @@ import {
   Code,
   Banknote,
   UserCheck,
+  RotateCcw,
 } from 'lucide-react';
 
 interface SidebarProps {
@@ -29,11 +30,12 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
     { id: 'billing', label: 'POS Billing', icon: ShoppingCart, highlight: true, shortcut: 'Alt+1' },
     { id: 'inventory', label: 'Inventory & Stock', icon: Boxes, shortcut: 'Alt+2' },
     { id: 'sales', label: 'Sales & Bills', icon: Receipt, shortcut: 'Alt+3' },
-    { id: 'movements', label: 'Stock Movements', icon: ArrowLeftRight, shortcut: 'Alt+4' },
-    { id: 'cash_control', label: 'Cash Control', icon: Banknote, shortcut: 'Alt+5' },
-    { id: 'customers', label: 'Customers', icon: UserCheck, shortcut: 'Alt+6' },
-    { id: 'expenses', label: 'Expenses', icon: Wallet, shortcut: 'Alt+7' },
-    { id: 'reports', label: 'Reports & P&L', icon: FileBarChart2, shortcut: 'Alt+8' },
+    { id: 'refunds', label: 'Customer Refunds', icon: RotateCcw, shortcut: 'Alt+4' },
+    { id: 'movements', label: 'Stock Movements', icon: ArrowLeftRight, shortcut: 'Alt+5' },
+    { id: 'cash_control', label: 'Cash Control', icon: Banknote, shortcut: 'Alt+6' },
+    { id: 'customers', label: 'Customers', icon: UserCheck, shortcut: 'Alt+7' },
+    { id: 'expenses', label: 'Expenses', icon: Wallet, shortcut: 'Alt+8' },
+    { id: 'reports', label: 'Reports & P&L', icon: FileBarChart2, shortcut: 'Alt+9' },
     { id: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'audit', label: 'Audit Trail', icon: ScrollText },
   ];
@@ -50,7 +52,7 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
   } else {
     const allowedTabIds = user?.permissions && user.permissions.length > 0
       ? user.permissions
-      : ['billing', 'inventory', 'sales', 'movements', 'cash_control', 'customers'];
+      : ['billing', 'inventory', 'sales', 'refunds', 'movements', 'cash_control', 'customers'];
     navItems = allOperationalTabs.filter(t => allowedTabIds.includes(t.id));
   }
 

@@ -389,14 +389,14 @@ export class SupabaseDb {
       if (!uErr && Array.isArray(users)) {
         const storeMap = new Map<string, CloudStore>();
         for (const u of users) {
-          const key = u.store_name || u.store_id || 'Frozen Bowl';
+          const key = u.store_name || u.store_id || 'FryFreeze';
           if (!storeMap.has(key)) {
             const isStopped =
               u.store_active === false ||
               ['STOPPED', 'INACTIVE', 'BLOCKED', 'SUSPENDED'].includes(String(u.store_status || '').toUpperCase());
             storeMap.set(key, {
               id: u.store_id || key,
-              name: u.store_name || (u.store_id === 'STORE-01' ? 'Frozen Bowl' : key),
+              name: u.store_name || (u.store_id === 'STORE-01' ? 'FryFreeze' : key),
               code: (u.store_name || key).toUpperCase().replace(/\s+/g, '-').slice(0, 10),
               active: !isStopped,
               status: isStopped ? 'STOPPED' : 'ACTIVE',

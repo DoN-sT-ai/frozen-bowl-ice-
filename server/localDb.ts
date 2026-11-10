@@ -314,6 +314,27 @@ class LocalDatabaseManager {
         updated_at TEXT NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS credit_notes (
+        id TEXT PRIMARY KEY,
+        credit_note_number TEXT NOT NULL UNIQUE,
+        store_id TEXT NOT NULL REFERENCES stores(id) ON DELETE CASCADE,
+        sale_id TEXT NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+        bill_number TEXT NOT NULL,
+        customer_name TEXT,
+        customer_phone TEXT,
+        refund_amount REAL NOT NULL,
+        refund_tax REAL NOT NULL DEFAULT 0.00,
+        refund_method TEXT NOT NULL DEFAULT 'CASH',
+        reason TEXT NOT NULL,
+        restock_items INTEGER NOT NULL DEFAULT 1,
+        items_json TEXT NOT NULL,
+        created_by TEXT,
+        created_by_name TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_credit_notes_store ON credit_notes(store_id);
+      CREATE INDEX IF NOT EXISTS idx_credit_notes_sale ON credit_notes(sale_id);
       CREATE INDEX IF NOT EXISTS idx_cash_sessions_store_status ON cash_drawer_sessions(store_id, status);
       CREATE INDEX IF NOT EXISTS idx_cash_sessions_opened_at ON cash_drawer_sessions(opened_at);
       CREATE INDEX IF NOT EXISTS idx_cash_tx_session ON cash_drawer_transactions(session_id);
@@ -334,6 +355,30 @@ class LocalDatabaseManager {
 
     try {
       this.db.exec("ALTER TABLE products ADD COLUMN package_info TEXT DEFAULT ''");
+    } catch {
+      // Column may already exist
+    }
+
+    try {
+      this.db.exec("ALTER TABLE sales ADD COLUMN refund_status TEXT DEFAULT 'NONE'");
+    } catch {
+      // Column may already exist
+    }
+
+    try {
+      this.db.exec("ALTER TABLE sales ADD COLUMN refunded_amount REAL DEFAULT 0.00");
+    } catch {
+      // Column may already exist
+    }
+
+    try {
+      this.db.exec("ALTER TABLE sales ADD COLUMN last_credit_note_id TEXT");
+    } catch {
+      // Column may already exist
+    }
+
+    try {
+      this.db.exec("ALTER TABLE sales ADD COLUMN last_credit_note_number TEXT");
     } catch {
       // Column may already exist
     }
@@ -1211,6 +1256,10 @@ export class LocalDb {
       igst: s.igst != null ? Number(s.igst) : undefined,
       round_off: s.round_off != null ? Number(s.round_off) : undefined,
       total: Number(s.total) || 0,
+      refund_status: s.refund_status || 'NONE',
+      refunded_amount: Number(s.refunded_amount) || 0,
+      last_credit_note_id: s.last_credit_note_id || undefined,
+      last_credit_note_number: s.last_credit_note_number || undefined,
       items: itemsBySaleId.get(s.id) || [],
     })) as Sale[];
   }
@@ -1231,6 +1280,10 @@ export class LocalDb {
       igst: saleRow.igst != null ? Number(saleRow.igst) : undefined,
       round_off: saleRow.round_off != null ? Number(saleRow.round_off) : undefined,
       total: Number(saleRow.total) || 0,
+      refund_status: saleRow.refund_status || 'NONE',
+      refunded_amount: Number(saleRow.refunded_amount) || 0,
+      last_credit_note_id: saleRow.last_credit_note_id || undefined,
+      last_credit_note_number: saleRow.last_credit_note_number || undefined,
       items: itemsRows.map(item => ({
         ...item,
         quantity: Number(item.quantity) || 0,
@@ -1265,6 +1318,10 @@ export class LocalDb {
       igst: saleRow.igst != null ? Number(saleRow.igst) : undefined,
       round_off: saleRow.round_off != null ? Number(saleRow.round_off) : undefined,
       total: Number(saleRow.total) || 0,
+      refund_status: saleRow.refund_status || 'NONE',
+      refunded_amount: Number(saleRow.refunded_amount) || 0,
+      last_credit_note_id: saleRow.last_credit_note_id || undefined,
+      last_credit_note_number: saleRow.last_credit_note_number || undefined,
       items: itemsRows.map(item => ({
         ...item,
         quantity: Number(item.quantity) || 0,
@@ -1281,6 +1338,129 @@ export class LocalDb {
         selected_modifiers: item.modifiers_json ? (() => { try { return JSON.parse(item.modifiers_json); } catch { return undefined; } })() : undefined,
       })),
     } as Sale;
+  }
+
+  // CREDIT NOTES & CUSTOMER REFUNDS
+  static async createCreditNote(creditNote: {
+    id: string;
+    credit_note_number: string;
+    store_id: string;
+    sale_id: string;
+    bill_number: string;
+    customer_name?: string;
+    customer_phone?: string;
+    refund_amount: number;
+    refund_tax?: number;
+    refund_method: string;
+    reason: string;
+    restock_items: boolean;
+    items: any[];
+    created_by?: string;
+    created_by_name?: string;
+    created_at: string;
+  }): Promise<any> {
+    const validStoreId = this.resolveValidStoreId(creditNote.store_id);
+    this.db.prepare(`
+      INSERT INTO credit_notes (
+        id, credit_note_number, store_id, sale_id, bill_number, customer_name,
+        customer_phone, refund_amount, refund_tax, refund_method, reason,
+        restock_items, items_json, created_by, created_by_name, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      creditNote.id,
+      creditNote.credit_note_number,
+      validStoreId,
+      creditNote.sale_id,
+      creditNote.bill_number,
+      creditNote.customer_name || null,
+      creditNote.customer_phone || null,
+      creditNote.refund_amount,
+      creditNote.refund_tax || 0,
+      creditNote.refund_method,
+      creditNote.reason,
+      creditNote.restock_items ? 1 : 0,
+      JSON.stringify(creditNote.items),
+      creditNote.created_by || null,
+      creditNote.created_by_name || null,
+      creditNote.created_at
+    );
+    return creditNote;
+  }
+
+  static async getCreditNotes(storeId: string, saleIdOrLimit?: string | number, limit = 200): Promise<any[]> {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    let saleId: string | undefined = undefined;
+    let finalLimit = 200;
+
+    if (typeof saleIdOrLimit === 'string' && saleIdOrLimit.trim()) {
+      saleId = saleIdOrLimit.trim();
+      finalLimit = limit;
+    } else if (typeof saleIdOrLimit === 'number') {
+      finalLimit = saleIdOrLimit;
+    }
+
+    let query = 'SELECT * FROM credit_notes WHERE store_id = ?';
+    const params: any[] = [validStoreId];
+
+    if (saleId) {
+      query += ' AND sale_id = ?';
+      params.push(saleId);
+    }
+
+    query += ' ORDER BY created_at DESC LIMIT ?';
+    params.push(finalLimit);
+
+    const rows = this.db.prepare(query).all(...params) as any[];
+
+    return rows.map(r => ({
+      ...r,
+      refund_amount: Number(r.refund_amount) || 0,
+      refund_tax: Number(r.refund_tax) || 0,
+      restock_items: Boolean(r.restock_items),
+      items: r.items_json ? (() => { try { return JSON.parse(r.items_json); } catch { return []; } })() : [],
+    }));
+  }
+
+  static async getCreditNoteById(id: string): Promise<any | null> {
+    const r = this.db.prepare('SELECT * FROM credit_notes WHERE id = ?').get(id) as any;
+    if (!r) return null;
+    return {
+      ...r,
+      refund_amount: Number(r.refund_amount) || 0,
+      refund_tax: Number(r.refund_tax) || 0,
+      restock_items: Boolean(r.restock_items),
+      items: r.items_json ? (() => { try { return JSON.parse(r.items_json); } catch { return []; } })() : [],
+    };
+  }
+
+  static getNextCreditNoteNumber(storeId: string): string {
+    const validStoreId = this.resolveValidStoreId(storeId);
+    const year = new Date().getFullYear();
+    const prefix = `CN-${year}-`;
+    const countRow = this.db.prepare(`
+      SELECT COUNT(*) as count FROM credit_notes WHERE store_id = ? AND credit_note_number LIKE ?
+    `).get(validStoreId, `${prefix}%`) as any;
+    const nextSeq = (countRow?.count || 0) + 1;
+    return `${prefix}${String(nextSeq).padStart(4, '0')}`;
+  }
+
+  static async updateSaleRefundStatus(
+    saleId: string,
+    refundStatus: 'PARTIAL' | 'FULL',
+    refundedAmount: number,
+    creditNoteId: string,
+    creditNoteNumber: string
+  ): Promise<void> {
+    // Statutory law: The original invoice remains immutable (COMPLETED).
+    // The refund is tracked via credit notes as independent accounting records.
+    this.db.prepare(`
+      UPDATE sales SET 
+        refund_status = ?,
+        refunded_amount = ?,
+        last_credit_note_id = ?,
+        last_credit_note_number = ?
+      WHERE id = ?
+    `).run(refundStatus, refundedAmount, creditNoteId, creditNoteNumber, saleId);
   }
 
   static async getCustomerByPhone(storeId: string, phone: string): Promise<{ customer_name: string; customer_phone: string; customer_gstin?: string } | null> {

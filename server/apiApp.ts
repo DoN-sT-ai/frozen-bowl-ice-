@@ -508,6 +508,50 @@ app.post('/api/sales/:id/void', requireAuth, requireAdmin, async (req: Authentic
   }
 });
 
+// Customer Refund & Credit Note Generation
+app.post('/api/sales/:id/refund', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { items, refundMethod, reason, restockAll } = req.body;
+    const result = await BillingService.createCreditNote({
+      storeId: req.user!.store_id,
+      userId: req.user!.id,
+      userName: req.user!.name,
+      saleId: req.params.id,
+      items: items || [],
+      refundMethod: refundMethod || 'CASH',
+      reason: reason || 'Customer requested refund',
+      restockAll,
+    });
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.status(400).json({ error: { message: err.message } });
+  }
+});
+
+// List Credit Notes
+app.get('/api/credit-notes', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { search, from, to } = req.query as any;
+    const list = await BillingService.getCreditNotes(req.user!.store_id, { search, from, to });
+    res.json(list);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
+// Get Single Credit Note
+app.get('/api/credit-notes/:id', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const note = await BillingService.getCreditNoteById(req.user!.store_id, req.params.id);
+    if (!note) {
+      return res.status(404).json({ error: { message: 'Credit note not found' } });
+    }
+    res.json(note);
+  } catch (err: any) {
+    res.status(500).json({ error: { message: err.message } });
+  }
+});
+
 // Admin-only: Purge all sales and reset sequences
 app.delete('/api/sales/purge-all', requireAuth, requireAdmin, async (req: AuthenticatedRequest, res: Response) => {
   try {

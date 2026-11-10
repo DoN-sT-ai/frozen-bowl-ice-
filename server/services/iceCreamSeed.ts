@@ -92,37 +92,32 @@ export function seedIceCreamParlourData(customDb?: DatabaseSync) {
       );
     `);
 
-    // 1. Clear old demo sales, products, and categories safely
     try {
       sqlite.exec(`
-        DELETE FROM sale_items;
-        DELETE FROM sales;
-        DELETE FROM stock_movements;
-      `);
-    } catch (_) {}
-
-    try {
-      sqlite.exec(`
-        DELETE FROM pos_refund_lines;
-        DELETE FROM pos_refunds;
         DELETE FROM pos_sale_item_modifiers;
         DELETE FROM pos_sale_items;
         DELETE FROM pos_payments;
+        DELETE FROM pos_refund_lines;
+        DELETE FROM pos_refunds;
         DELETE FROM pos_sales;
-        DELETE FROM purchase_lines;
-        DELETE FROM purchases;
+        DELETE FROM sale_items;
+        DELETE FROM sales;
         DELETE FROM stock_count_lines;
         DELETE FROM stock_counts;
         DELETE FROM wastage_records;
+        DELETE FROM purchase_lines;
+        DELETE FROM purchases;
+        DELETE FROM stock_movements;
         DELETE FROM inventory_movements;
         DELETE FROM inventory_lots;
-        DELETE FROM recipe_ingredients;
-        DELETE FROM recipe_versions;
-        DELETE FROM product_modifier_groups;
         DELETE FROM modifier_ingredients;
+        DELETE FROM recipe_ingredients;
+        DELETE FROM product_modifier_groups;
         DELETE FROM modifiers;
         DELETE FROM modifier_groups;
+        DELETE FROM recipe_versions;
         DELETE FROM bom_products;
+        DELETE FROM inventory_items;
         DELETE FROM products;
         DELETE FROM categories;
         DELETE FROM suppliers;

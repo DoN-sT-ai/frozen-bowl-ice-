@@ -364,7 +364,7 @@ export class AuthService {
 
     const store = db.stores.find(s => s.id === session.storeId) || db.stores[0] || {
       id: session.storeId,
-      name: 'Frozen Bowl Ice Cream',
+      name: 'FryFreeze',
       code: 'STORE-01',
       currency: 'INR',
       invoice_prefix: 'BILL-',

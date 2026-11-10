@@ -81,12 +81,12 @@ async function runPrinterTests() {
 
   const customSettingsToSave = {
     ...DEFAULT_THERMAL_PRINTER_SETTINGS,
-    headerStoreNameOverride: 'Frozen Bowl Ice Cream & Shakes',
+    headerStoreNameOverride: 'FryFreeze Express Counter',
     headerTagline: 'Best Sundaes in Town',
     showFssai: true,
     fssaiNumber: '12423008000123',
-    footerPrimaryMessage: 'Thank you for dining with Frozen Bowl!',
-    footerSecondaryNote: 'Follow us on Instagram @frozenbowl',
+    footerPrimaryMessage: 'Thank you for dining with FryFreeze!',
+    footerSecondaryNote: 'Follow us on Instagram @fryfreeze',
     format: '80mm' as const,
     density: 'compact' as const,
   };
@@ -96,12 +96,12 @@ async function runPrinterTests() {
   // Retrieve back from SQLite to simulate app reopen/fresh session
   const persisted = await LocalDb.getPrinterSettings(storeId);
   assert.ok(persisted, 'Persisted settings must be retrieved from SQLite database');
-  assert.strictEqual(persisted.headerStoreNameOverride, 'Frozen Bowl Ice Cream & Shakes');
+  assert.strictEqual(persisted.headerStoreNameOverride, 'FryFreeze Express Counter');
   assert.strictEqual(persisted.headerTagline, 'Best Sundaes in Town');
   assert.strictEqual(persisted.showFssai, true);
   assert.strictEqual(persisted.fssaiNumber, '12423008000123');
-  assert.strictEqual(persisted.footerPrimaryMessage, 'Thank you for dining with Frozen Bowl!');
-  assert.strictEqual(persisted.footerSecondaryNote, 'Follow us on Instagram @frozenbowl');
+  assert.strictEqual(persisted.footerPrimaryMessage, 'Thank you for dining with FryFreeze!');
+  assert.strictEqual(persisted.footerSecondaryNote, 'Follow us on Instagram @fryfreeze');
   assert.strictEqual(persisted.density, 'compact');
   console.log('✅ Test 4 Passed: Customized bill settings persisted in SQLite database across app closing/reopening.\n');
 

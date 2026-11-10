@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Product, CartItem, Sale, SelectedModifier, CustomerSuggestion } from '../../types';
+import { Product, CartItem, Sale, SelectedModifier, CustomerSuggestion, HeldBill } from '../../types';
 import { api } from '../../lib/api';
-import { formatCurrency, formatBillNumber } from '../../lib/utils';
+import { formatCurrency, formatBillNumber, formatDateTime } from '../../lib/utils';
 import { ModifierModal } from './ModifierModal';
 import { playScannerBeep } from '../../lib/barcodeUtils';
 import { useAuth } from '../../context/AuthContext';
@@ -31,6 +31,10 @@ import {
   Loader2,
   User,
   Phone,
+  PauseCircle,
+  PlayCircle,
+  Clock,
+  BookmarkPlus,
 } from 'lucide-react';
 
 interface POSWorkspaceProps {
@@ -57,6 +61,31 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'UPI' | 'CARD' | 'OTHER'>('UPI');
   const [customerNotes, setCustomerNotes] = useState<string>('');
   const [cashTendered, setCashTendered] = useState<string>('');
+
+  // Held Bills (Parked Orders) State
+  const [heldBills, setHeldBills] = useState<HeldBill[]>(() => {
+    try {
+      const stored = localStorage.getItem('fryfreeze_held_bills');
+      return stored ? JSON.parse(stored) : [];
+    } catch {
+      return [];
+    }
+  });
+  const [activeHeldBillId, setActiveHeldBillId] = useState<string | null>(null);
+  const [showHeldBillsModal, setShowHeldBillsModal] = useState<boolean>(false);
+  const [heldNotification, setHeldNotification] = useState<{ type: 'success' | 'info'; text: string } | null>(null);
+
+  const saveHeldBills = (newHeld: HeldBill[]) => {
+    setHeldBills(newHeld);
+    try {
+      localStorage.setItem('fryfreeze_held_bills', JSON.stringify(newHeld));
+    } catch (_) {}
+  };
+
+  const notifyHeld = (text: string) => {
+    setHeldNotification({ type: 'success', text });
+    setTimeout(() => setHeldNotification(null), 3500);
+  };
 
   const { store } = useAuth();
 
@@ -465,6 +494,97 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
   addToCartRef.current = addToCart;
   filteredProductsRef.current = filteredProducts;
 
+  // ============================================================
+  // BILL HOLD ENGINE (Multi-Cart Park & Resume)
+  // ============================================================
+  const handleHoldCurrentBill = () => {
+    if (cart.length === 0) {
+      setErrorMessage('Cart is empty. Add items to cart before holding.');
+      return;
+    }
+
+    const currentTotal = totalPayable;
+    const billLabel = customerName.trim()
+      ? customerName.trim()
+      : customerPhone.trim()
+      ? `Cust ${customerPhone.trim().slice(-4)}`
+      : `Held Order #${heldBills.length + 1}`;
+
+    const newHeld: HeldBill = {
+      id: `hold_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      heldAt: new Date().toISOString(),
+      label: billLabel,
+      customerName: customerName.trim() || undefined,
+      customerPhone: customerPhone.trim() || undefined,
+      customerGstin: customerGstin.trim() ? customerGstin.trim().toUpperCase() : undefined,
+      items: [...cart],
+      discount,
+      paymentMethod,
+      customerNotes,
+      gstType,
+      sellingTaxMode,
+      total: currentTotal,
+      subtotal: subtotal,
+      tax: estimatedTax,
+    };
+
+    saveHeldBills([newHeld, ...heldBills]);
+    setActiveHeldBillId(null);
+    clearCart();
+    notifyHeld(`Bill held: "${billLabel}" (${formatCurrency(currentTotal)})`);
+  };
+
+  const handleRecallHeldBill = (bill: HeldBill) => {
+    // If active cart already has items, park active cart first
+    if (cart.length > 0) {
+      const activeLabel = customerName.trim() ? customerName.trim() : `Held #${heldBills.length + 1}`;
+      const activeHeld: HeldBill = {
+        id: `hold_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        heldAt: new Date().toISOString(),
+        label: activeLabel,
+        customerName: customerName.trim() || undefined,
+        customerPhone: customerPhone.trim() || undefined,
+        customerGstin: customerGstin.trim() ? customerGstin.trim().toUpperCase() : undefined,
+        items: [...cart],
+        discount,
+        paymentMethod,
+        customerNotes,
+        gstType,
+        sellingTaxMode,
+        total: totalPayable,
+        subtotal: subtotal,
+        tax: estimatedTax,
+      };
+      saveHeldBills([activeHeld, ...heldBills.filter((b) => b.id !== bill.id)]);
+    } else {
+      saveHeldBills(heldBills.filter((b) => b.id !== bill.id));
+    }
+
+    setCart(bill.items);
+    setDiscount(bill.discount || 0);
+    setPaymentMethod(bill.paymentMethod || 'UPI');
+    setCustomerNotes(bill.customerNotes || '');
+    setCustomerName(bill.customerName || '');
+    customerNameRef.current = bill.customerName || '';
+    setCustomerPhone(bill.customerPhone || '');
+    customerPhoneRef.current = bill.customerPhone || '';
+    setCustomerGstin(bill.customerGstin || '');
+    customerGstinRef.current = bill.customerGstin || '';
+    setGstType(bill.gstType || 'INTRA_STATE');
+    if (bill.sellingTaxMode) setSellingTaxMode(bill.sellingTaxMode);
+    setActiveHeldBillId(bill.id);
+    setShowHeldBillsModal(false);
+    notifyHeld(`Resumed bill: "${bill.label || 'Held Order'}"`);
+  };
+
+  const handleDiscardHeldBill = (billId: string) => {
+    saveHeldBills(heldBills.filter((b) => b.id !== billId));
+    if (activeHeldBillId === billId) {
+      setActiveHeldBillId(null);
+    }
+    notifyHeld('Held bill discarded');
+  };
+
   // Direct Silent Print to connected hardware printer (no preview tabs, no dialogs)
   const triggerAutoPrint = (saleToPrint: Sale) => {
     const settings = getPrinterSettings();
@@ -558,6 +678,12 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
       setCashTendered('');
       setDiscount(0);
       setMobileTab('catalog');
+
+      // If completing a held bill, remove it from held bills storage
+      if (activeHeldBillId) {
+        saveHeldBills(heldBills.filter((b) => b.id !== activeHeldBillId));
+        setActiveHeldBillId(null);
+      }
 
       // Generate verification QR code non-blockingly
       const publicVerificationUrl = `${window.location.origin}/?verify=${sale.verification_token}`;
@@ -823,6 +949,13 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
         return;
       }
 
+      // F4 or Alt+H: Hold Current Bill
+      if (e.key === 'F4' || (e.altKey && (e.key === 'h' || e.key === 'H'))) {
+        e.preventDefault();
+        handleHoldCurrentBill();
+        return;
+      }
+
       // F6: Cycle Payment Method
       if (e.key === 'F6') {
         e.preventDefault();
@@ -867,6 +1000,10 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
 
       // Escape: Cancel double-Enter prompt, close modal, or refocus search
       if (e.key === 'Escape') {
+        if (showHeldBillsModal) {
+          setShowHeldBillsModal(false);
+          return;
+        }
         if (confirmPrintPromptRef.current) {
           e.preventDefault();
           if (confirmPrintTimerRef.current) clearTimeout(confirmPrintTimerRef.current);
@@ -989,6 +1126,22 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               <X className="w-3.5 h-3.5" />
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Held Bill Action Feedback Banner */}
+      {heldNotification && (
+        <div className="bg-amber-600 text-white px-4 py-2 flex items-center justify-between text-xs shadow-sm shrink-0 gap-2 animate-in slide-in-from-top-2">
+          <div className="flex items-center gap-2">
+            <PauseCircle className="w-4 h-4 text-amber-200" />
+            <span className="font-medium">{heldNotification.text}</span>
+          </div>
+          <button
+            onClick={() => setHeldNotification(null)}
+            className="p-0.5 hover:bg-amber-700 rounded text-amber-200 hover:text-white transition cursor-pointer"
+          >
+            <X className="w-3 h-3" />
+          </button>
         </div>
       )}
 
@@ -1176,6 +1329,26 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               )}
             </div>
 
+            {/* Held Bills Access Pill */}
+            <button
+              type="button"
+              onClick={() => setShowHeldBillsModal(true)}
+              className={`flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-bold transition-all cursor-pointer shrink-0 border ${
+                heldBills.length > 0
+                  ? 'bg-amber-50 hover:bg-amber-100 text-amber-900 border-amber-300 shadow-2xs'
+                  : 'bg-neutral-50 hover:bg-neutral-100 text-neutral-600 border-neutral-200'
+              }`}
+              title="View all held bills / parked orders"
+            >
+              <PauseCircle className={`w-3.5 h-3.5 ${heldBills.length > 0 ? 'text-amber-600' : 'text-neutral-400'}`} />
+              <span>Held Bills</span>
+              {heldBills.length > 0 && (
+                <span className="ml-0.5 px-1.5 py-0.2 bg-amber-600 text-white rounded-full text-[10px] font-mono font-bold">
+                  {heldBills.length}
+                </span>
+              )}
+            </button>
+
             <div className="hidden sm:flex items-center gap-1.5 px-3 py-2 bg-neutral-100 rounded-lg text-xs font-medium text-neutral-700 shrink-0">
               <Sparkles className="w-3.5 h-3.5 text-amber-500" />
               <span>{filteredProducts.length} items</span>
@@ -1189,6 +1362,9 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               Enter ↵ x2
             </span>
             <span className="text-neutral-700 font-medium">Print Bill</span>
+            <span className="text-neutral-300">·</span>
+            <span className="bg-amber-100 text-amber-900 border border-amber-300 rounded px-1.5 py-0.2 font-mono text-[10px] font-bold">F4</span>
+            <span className="text-neutral-700 font-medium">Hold Bill</span>
             <span className="text-neutral-300">·</span>
             <span className="bg-neutral-200 border border-neutral-300 rounded px-1.5 py-0.2 font-mono text-[10px] text-neutral-700 font-semibold">F2</span>
             <span>Search</span>
@@ -1375,14 +1551,39 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               Current Bill ({cart.reduce((sum, i) => sum + i.quantity, 0)} Items)
             </h2>
           </div>
-          {cart.length > 0 && (
-            <button
-              onClick={clearCart}
-              className="text-[11px] text-red-600 hover:text-red-800 font-medium transition-colors cursor-pointer"
-            >
-              Clear Cart
-            </button>
-          )}
+          <div className="flex items-center gap-1.5">
+            {heldBills.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowHeldBillsModal(true)}
+                className="px-2 py-0.5 bg-amber-100 hover:bg-amber-200 text-amber-900 border border-amber-300 rounded text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                title="View Held Bills"
+              >
+                <Clock className="w-3 h-3" />
+                <span>Held ({heldBills.length})</span>
+              </button>
+            )}
+            {cart.length > 0 && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleHoldCurrentBill}
+                  className="px-2 py-0.5 bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 rounded text-[11px] font-bold flex items-center gap-1 transition-colors cursor-pointer"
+                  title="Hold this bill and start a new order (F4)"
+                >
+                  <PauseCircle className="w-3 h-3 text-amber-700" />
+                  <span>Hold (F4)</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={clearCart}
+                  className="text-[11px] text-red-600 hover:text-red-800 font-medium transition-colors cursor-pointer ml-0.5"
+                >
+                  Clear
+                </button>
+              </>
+            )}
+          </div>
         </div>
 
         {/* Employee Selling Tax Mode Selector */}
@@ -1977,6 +2178,34 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
               </>
             )}
           </button>
+
+          {/* Secondary Actions: Hold Bill & Recall Held Bills */}
+          <div className="grid grid-cols-2 gap-2 pt-0.5">
+            <button
+              type="button"
+              onClick={handleHoldCurrentBill}
+              disabled={cart.length === 0 || isSubmitting}
+              className="py-2 px-2.5 bg-amber-50 hover:bg-amber-100 disabled:opacity-40 disabled:hover:bg-amber-50 text-amber-900 border border-amber-300 rounded text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer"
+              title="Park / Hold current cart to serve another customer (F4)"
+            >
+              <PauseCircle className="w-3.5 h-3.5 text-amber-700" />
+              <span>Hold Bill (F4)</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={() => setShowHeldBillsModal(true)}
+              className={`py-2 px-2.5 rounded text-xs font-bold flex items-center justify-center gap-1.5 transition-colors cursor-pointer border ${
+                heldBills.length > 0
+                  ? 'bg-neutral-900 hover:bg-neutral-800 text-white border-neutral-900 shadow-xs'
+                  : 'bg-neutral-100 hover:bg-neutral-200 text-neutral-600 border-neutral-200'
+              }`}
+              title="Open and recall parked bills"
+            >
+              <Clock className="w-3.5 h-3.5" />
+              <span>Held Bills ({heldBills.length})</span>
+            </button>
+          </div>
         </div>
       </div>
       </div>
@@ -2206,6 +2435,129 @@ export const POSWorkspace: React.FC<POSWorkspaceProps> = ({ onNavigateToSales })
           onAddToCart={(prod, mods, qty) => addToCart(prod, qty, mods)}
           onClose={() => setCustomizingProduct(null)}
         />
+      )}
+
+      {/* Held Bills & Parked Orders Modal */}
+      {showHeldBillsModal && (
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 animate-in fade-in duration-150">
+          <div className="bg-white rounded-xl border border-neutral-300 shadow-2xl max-w-lg w-full overflow-hidden flex flex-col max-h-[85vh]">
+            {/* Modal Header */}
+            <div className="p-4 bg-amber-50 border-b border-amber-200 flex items-center justify-between shrink-0">
+              <div className="flex items-center gap-2">
+                <div className="w-8 h-8 rounded-lg bg-amber-500/20 text-amber-800 flex items-center justify-center">
+                  <PauseCircle className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold text-amber-950">
+                    Held Bills & Parked Orders ({heldBills.length})
+                  </h3>
+                  <p className="text-[11px] text-amber-700">
+                    Switch between customers or resume orders without losing items.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowHeldBillsModal(false)}
+                className="p-1 rounded-lg text-amber-800 hover:bg-amber-100 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            {/* Modal Content */}
+            <div className="flex-1 overflow-y-auto p-4 space-y-3">
+              {heldBills.length === 0 ? (
+                <div className="p-8 text-center text-xs text-neutral-500 space-y-2">
+                  <Clock className="w-8 h-8 text-neutral-300 mx-auto" />
+                  <p className="font-semibold text-neutral-700">No bills currently on hold</p>
+                  <p className="text-[11px] text-neutral-400 max-w-xs mx-auto">
+                    Add items to your active cart and click <strong>"Hold Bill (F4)"</strong> to park a customer's order.
+                  </p>
+                </div>
+              ) : (
+                heldBills.map((bill, index) => {
+                  const itemCount = bill.items.reduce((sum, i) => sum + i.quantity, 0);
+                  const itemsPreview = bill.items
+                    .map((i) => `${i.quantity}x ${i.product.name}`)
+                    .join(', ');
+                  return (
+                    <div
+                      key={bill.id}
+                      className="p-3 bg-neutral-50 hover:bg-amber-50/40 rounded-lg border border-neutral-200 transition-all space-y-2"
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-xs text-neutral-900">
+                              {bill.label || `Held Order #${index + 1}`}
+                            </span>
+                            <span className="px-1.5 py-0.2 bg-amber-100 text-amber-800 rounded text-[10px] font-mono font-semibold">
+                              {itemCount} {itemCount === 1 ? 'item' : 'items'}
+                            </span>
+                          </div>
+                          {(bill.customerName || bill.customerPhone) && (
+                            <div className="text-[11px] text-neutral-600 font-medium mt-0.5">
+                              {bill.customerName}{' '}
+                              {bill.customerPhone ? `· ${bill.customerPhone}` : ''}
+                            </div>
+                          )}
+                          <div className="text-[10px] text-neutral-400 font-mono mt-0.5">
+                            Held: {formatDateTime(bill.heldAt)}
+                          </div>
+                        </div>
+
+                        <div className="text-right">
+                          <span className="font-mono font-bold text-sm text-neutral-900 block">
+                            {formatCurrency(bill.total)}
+                          </span>
+                          <span className="text-[10px] text-neutral-400 font-mono">
+                            {bill.paymentMethod}
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Items preview text */}
+                      <p className="text-[11px] text-neutral-500 truncate" title={itemsPreview}>
+                        {itemsPreview}
+                      </p>
+
+                      {/* Actions */}
+                      <div className="flex items-center justify-end gap-2 pt-1 border-t border-neutral-100">
+                        <button
+                          type="button"
+                          onClick={() => handleDiscardHeldBill(bill.id)}
+                          className="px-2.5 py-1 text-red-600 hover:bg-red-50 rounded text-xs font-medium transition-colors flex items-center gap-1 cursor-pointer"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                          <span>Discard</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleRecallHeldBill(bill)}
+                          className="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition-colors flex items-center gap-1 shadow-xs cursor-pointer"
+                        >
+                          <PlayCircle className="w-3.5 h-3.5" />
+                          <span>Resume Order</span>
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-3 bg-neutral-50 border-t border-neutral-200 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowHeldBillsModal(false)}
+                className="px-4 py-1.5 bg-white border border-neutral-300 hover:bg-neutral-100 text-neutral-700 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+              >
+                Close (Esc)
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

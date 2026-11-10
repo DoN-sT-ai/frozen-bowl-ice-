@@ -17,9 +17,15 @@ export class DashboardService {
     // Map sale items to sales for date filtering
     const saleDateMap = new Map(validSales.map(s => [s.id, s.created_at]));
 
+    // Credit notes & refunds
+    const creditNotes = (db.credit_notes || []).filter(cn => cn.store_id === storeId);
+    const todayCreditNotes = creditNotes.filter(cn => cn.created_at.startsWith(todayStr));
+    const todayRefunds = round2(todayCreditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
+
     // Today's metrics
     const todaySalesList = validSales.filter(s => s.created_at.startsWith(todayStr));
-    const todayRevenue = round2(todaySalesList.reduce((sum, s) => sum + s.total, 0));
+    const todayGrossRevenue = round2(todaySalesList.reduce((sum, s) => sum + s.total, 0));
+    const todayRevenue = round2(Math.max(0, todayGrossRevenue - todayRefunds));
     const todayBillsCount = todaySalesList.length;
 
     // Today's COGS
@@ -35,8 +41,11 @@ export class DashboardService {
     const todayNetProfit = round2(todayGrossProfit - todayExpenses);
 
     // Month metrics
+    const monthCreditNotes = creditNotes.filter(cn => cn.created_at.startsWith(currentMonthStr));
+    const monthRefunds = round2(monthCreditNotes.reduce((sum, cn) => sum + cn.refund_amount, 0));
     const monthSalesList = validSales.filter(s => s.created_at.startsWith(currentMonthStr));
-    const monthRevenue = round2(monthSalesList.reduce((sum, s) => sum + s.total, 0));
+    const monthGrossRevenue = round2(monthSalesList.reduce((sum, s) => sum + s.total, 0));
+    const monthRevenue = round2(Math.max(0, monthGrossRevenue - monthRefunds));
 
     const monthSaleIds = new Set(monthSalesList.map(s => s.id));
     const monthItems = validSaleItems.filter(si => monthSaleIds.has(si.sale_id));

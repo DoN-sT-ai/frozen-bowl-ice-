@@ -140,6 +140,10 @@ export interface Sale {
   total: number;
   payment_method: 'CASH' | 'UPI' | 'CARD' | 'OTHER';
   status: 'COMPLETED' | 'VOIDED' | 'REFUNDED';
+  refund_status?: 'NONE' | 'PARTIAL' | 'FULL';
+  refunded_amount?: number;
+  last_credit_note_id?: string;
+  last_credit_note_number?: string;
   notes?: string;
   created_at: string;
   voided_at?: string;
@@ -245,6 +249,37 @@ export interface EmployeeTabPermissions {
   updated_at: string;
 }
 
+export interface CreditNoteItem {
+  sale_item_id: string;
+  product_id: string;
+  product_name: string;
+  quantity_refunded: number;
+  unit_price: number;
+  tax_rate: number;
+  tax_amount: number;
+  refund_amount: number;
+  restocked: boolean;
+}
+
+export interface CreditNote {
+  id: string;
+  credit_note_number: string;
+  store_id: string;
+  sale_id: string;
+  bill_number: string;
+  customer_name?: string;
+  customer_phone?: string;
+  refund_amount: number;
+  refund_tax: number;
+  refund_method: 'CASH' | 'UPI' | 'CARD' | 'STORE_CREDIT';
+  reason: string;
+  restock_items: boolean;
+  items: CreditNoteItem[];
+  created_by?: string;
+  created_by_name?: string;
+  created_at: string;
+}
+
 export interface DatabaseSchema {
   stores: Store[];
   users: User[];
@@ -259,6 +294,7 @@ export interface DatabaseSchema {
   cash_drawer_sessions?: CashDrawerSession[];
   cash_drawer_transactions?: CashDrawerTransaction[];
   employee_tab_permissions?: EmployeeTabPermissions[];
+  credit_notes?: CreditNote[];
 }
 
 // ============================================================
@@ -344,6 +380,7 @@ class Database {
     expenses: [],
     audit_logs: [],
     bill_sequences: [],
+    credit_notes: [],
   };
 
   private initialized = false;
@@ -399,6 +436,7 @@ class Database {
         sales,
         expenses,
         audit_logs,
+        credit_notes,
       ] = await Promise.all([
         LocalDb.getUsers(storeId),
         LocalDb.getCategories(storeId),
@@ -407,6 +445,7 @@ class Database {
         LocalDb.getSales(storeId, 500),
         LocalDb.getExpenses(storeId),
         LocalDb.getAuditLogs(storeId, 500),
+        LocalDb.getCreditNotes(storeId),
       ]);
 
       this.cache.users = users;
@@ -416,6 +455,7 @@ class Database {
       this.cache.sales = sales;
       this.cache.expenses = expenses;
       this.cache.audit_logs = audit_logs;
+      this.cache.credit_notes = credit_notes;
 
       const saleItems: SaleItem[] = [];
       sales.forEach(s => {
@@ -445,6 +485,7 @@ class Database {
   get expenses() { return this.cache.expenses; }
   get audit_logs() { return this.cache.audit_logs; }
   get bill_sequences() { return this.cache.bill_sequences; }
+  get credit_notes() { return this.cache.credit_notes || []; }
 
   // Sequential bill number using atomic SQLite counter
   public async getNextBillNumberAsync(storeId: string): Promise<string> {

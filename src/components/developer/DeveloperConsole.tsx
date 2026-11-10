@@ -33,7 +33,7 @@ export const DeveloperConsole: React.FC = () => {
 
   // Wireless Updates state
   const [appVersionInfo, setAppVersionInfo] = useState<{ version: string; isPackaged: boolean; feedUrl?: string }>({
-    version: '2.1.5',
+    version: '2.1.6',
     isPackaged: false,
   });
   const [updaterStatus, setUpdaterStatus] = useState<UpdateStatusData | null>(null);

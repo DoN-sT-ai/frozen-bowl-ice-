@@ -1,4 +1,4 @@
-import { db, Sale, SaleItem, StockMovement } from '../db.ts';
+import { db, Sale, SaleItem, StockMovement, CreditNote } from '../db.ts';
 import { LocalDb } from '../localDb.ts';
 import { AuditService } from './auditService.ts';
 import { SupabaseDb } from '../supabaseDb.ts';
@@ -348,6 +348,8 @@ export class BillingService {
       total: roundedTotal,
       payment_method: payload.paymentMethod,
       status: 'COMPLETED',
+      refund_status: 'NONE',
+      refunded_amount: 0,
       notes: payload.notes?.trim() || undefined,
       created_at: now,
       items: saleItems,
@@ -543,5 +545,247 @@ export class BillingService {
     if (!sale) throw new Error('Sale not found');
     const items = db.sale_items.filter(si => si.sale_id === sale.id);
     return { ...sale, items };
+  }
+
+  // ============================================================
+  // CUSTOMER REFUND & CREDIT NOTE ENGINE
+  // ============================================================
+
+  static async createCreditNote(params: {
+    storeId: string;
+    userId: string;
+    userName: string;
+    saleId: string;
+    items: Array<{
+      saleItemId: string;
+      productId: string;
+      quantityRefunded: number;
+      restock: boolean;
+    }>;
+    refundMethod: 'CASH' | 'UPI' | 'CARD' | 'STORE_CREDIT';
+    reason: string;
+    restockAll?: boolean;
+  }): Promise<{ creditNote: any; sale: Sale }> {
+    const { storeId, userId, userName, saleId, items: requestedItems, refundMethod, reason, restockAll } = params;
+
+    if (!reason || !reason.trim()) {
+      throw new Error('A reason is mandatory for issuing a credit note');
+    }
+
+    if (!requestedItems || requestedItems.length === 0) {
+      throw new Error('At least one item must be selected for refund');
+    }
+
+    let sale = db.sales.find(s => s.id === saleId && s.store_id === storeId);
+    if (!sale) {
+      const row = await LocalDb.getSaleById(saleId);
+      if (row && row.store_id === storeId) {
+        sale = row;
+      }
+    }
+    if (!sale) throw new Error('Original sale invoice not found');
+    if (sale.status === 'VOIDED') throw new Error('Cannot refund a voided bill');
+
+    const saleItems = (db.sale_items && db.sale_items.filter(si => si.sale_id === sale!.id).length > 0)
+      ? db.sale_items.filter(si => si.sale_id === sale!.id)
+      : (sale.items || []);
+
+    const now = new Date().toISOString();
+    const creditNoteId = crypto.randomUUID();
+    const creditNoteNumber = LocalDb.getNextCreditNoteNumber(storeId);
+
+    // Track previous refunds on this sale to prevent over-refunding
+    const existingCreditNotes = await LocalDb.getCreditNotes(storeId, sale.id);
+    const alreadyRefundedByItem = new Map<string, number>();
+    for (const cn of existingCreditNotes) {
+      for (const it of (cn.items || [])) {
+        const prev = alreadyRefundedByItem.get(it.sale_item_id) || 0;
+        alreadyRefundedByItem.set(it.sale_item_id, prev + (Number(it.quantity_refunded) || 0));
+      }
+    }
+
+    // Calculate line items refund
+    let totalRefundAmount = 0;
+    let totalRefundTax = 0;
+    const creditNoteItems: any[] = [];
+
+    for (const reqItem of requestedItems) {
+      const originalItem = saleItems.find(si => si.id === reqItem.saleItemId);
+      if (!originalItem) {
+        throw new Error(`Item ${reqItem.saleItemId} not found in original sale`);
+      }
+
+      const qtyRefund = Number(reqItem.quantityRefunded !== undefined ? reqItem.quantityRefunded : (reqItem as any).quantity);
+      if (isNaN(qtyRefund) || qtyRefund <= 0) {
+        throw new Error(`Invalid refund quantity for item ${originalItem.product_name_snapshot}`);
+      }
+
+      const prevRefunded = alreadyRefundedByItem.get(originalItem.id) || 0;
+      const remainingQty = originalItem.quantity - prevRefunded;
+      if (remainingQty <= 0) {
+        throw new Error(`Item ${originalItem.product_name_snapshot} is already fully refunded`);
+      }
+
+      if (qtyRefund > remainingQty) {
+        throw new Error(`Refund quantity (${qtyRefund}) cannot exceed remaining refundable quantity (${remainingQty}) for ${originalItem.product_name_snapshot}`);
+      }
+
+      // Calculate proportionate refund amount
+      const unitTotal = originalItem.line_total / originalItem.quantity;
+      const unitTax = (originalItem.tax_amount || 0) / originalItem.quantity;
+      const lineRefund = Number((unitTotal * qtyRefund).toFixed(2));
+      const lineTaxRefund = Number((unitTax * qtyRefund).toFixed(2));
+
+      totalRefundAmount = Number((totalRefundAmount + lineRefund).toFixed(2));
+      totalRefundTax = Number((totalRefundTax + lineTaxRefund).toFixed(2));
+
+      const shouldRestock = restockAll !== undefined ? Boolean(restockAll) : Boolean(reqItem.restock);
+
+      creditNoteItems.push({
+        sale_item_id: originalItem.id,
+        product_id: originalItem.product_id,
+        product_name: originalItem.product_name_snapshot,
+        quantity_refunded: qtyRefund,
+        unit_price: originalItem.unit_price,
+        tax_rate: originalItem.tax_rate,
+        tax_amount: lineTaxRefund,
+        refund_amount: lineRefund,
+        restocked: shouldRestock,
+      });
+
+      // Handle inventory restock if requested
+      if (shouldRestock) {
+        const product = db.products.find(p => p.id === originalItem.product_id && p.store_id === storeId);
+        if (product) {
+          const beforeStock = product.current_stock;
+          const afterStock = beforeStock + qtyRefund;
+          product.current_stock = afterStock;
+          product.updated_at = now;
+
+          const restockMov: any = {
+            id: crypto.randomUUID(),
+            store_id: storeId,
+            product_id: product.id,
+            product_name: product.name,
+            user_id: userId,
+            user_name: userName,
+            type: 'RESTOCK',
+            quantity: qtyRefund,
+            before_stock: beforeStock,
+            after_stock: afterStock,
+            reason: `Restocked via Credit Note #${creditNoteNumber} (Bill #${sale.bill_number}): ${reason.trim()}`,
+            reference_type: 'CREDIT_NOTE',
+            reference_id: creditNoteId,
+            created_at: now,
+          };
+
+          await LocalDb.createStockMovement(restockMov).catch(() => {});
+          await LocalDb.updateProduct(product.id, { current_stock: afterStock, updated_at: now }).catch(() => {});
+          db.stock_movements.unshift(restockMov as StockMovement);
+        }
+      }
+    }
+
+    const previouslyRefunded = Number(sale.refunded_amount || 0);
+    const newTotalRefunded = Number((previouslyRefunded + totalRefundAmount).toFixed(2));
+    const isFullRefund = newTotalRefunded >= (Number(sale.total) - 0.01);
+    const refundStatus: 'PARTIAL' | 'FULL' = isFullRefund ? 'FULL' : 'PARTIAL';
+
+    const creditNoteRecord: any = {
+      id: creditNoteId,
+      credit_note_number: creditNoteNumber,
+      store_id: storeId,
+      sale_id: sale.id,
+      bill_number: sale.bill_number,
+      customer_name: sale.customer_name,
+      customer_phone: sale.customer_phone,
+      refund_amount: totalRefundAmount,
+      refund_tax: totalRefundTax,
+      refund_method: refundMethod || 'CASH',
+      reason: reason.trim(),
+      restock_items: creditNoteItems.some(i => i.restocked),
+      items: creditNoteItems,
+      created_by: userId,
+      created_by_name: userName,
+      created_at: now,
+    };
+
+    // Save credit note to SQLite
+    await LocalDb.createCreditNote(creditNoteRecord);
+    await LocalDb.updateSaleRefundStatus(sale.id, refundStatus, newTotalRefunded, creditNoteId, creditNoteNumber);
+
+    // Update memory cache
+    if (!db.credit_notes) (db as any).cache.credit_notes = [];
+    db.credit_notes.unshift(creditNoteRecord);
+
+    sale.refund_status = refundStatus;
+    sale.refunded_amount = newTotalRefunded;
+    sale.last_credit_note_id = creditNoteId;
+    sale.last_credit_note_number = creditNoteNumber;
+    // Statutory law: The original invoice is immutable and remains COMPLETED.
+    // The refund is tracked through the credit note record.
+
+    // Cash drawer integration: if cash refund, record cash out from drawer
+    if (refundMethod === 'CASH') {
+      await CashControlService.recordRefundIfSessionOpen(storeId, creditNoteRecord, userId, userName);
+    }
+
+    AuditService.log({
+      storeId,
+      userId,
+      userName,
+      action: 'CREDIT_NOTE_CREATED',
+      entityType: 'CREDIT_NOTE',
+      entityId: creditNoteId,
+      afterData: {
+        creditNoteNumber,
+        billNumber: sale.bill_number,
+        refundAmount: totalRefundAmount,
+        refundMethod,
+        reason: reason.trim(),
+        refundStatus,
+      },
+    });
+
+    return { creditNote: creditNoteRecord, sale };
+  }
+
+  static async getCreditNotes(storeId: string, options?: { search?: string; from?: string; to?: string }) {
+    let list: CreditNote[] = await LocalDb.getCreditNotes(storeId, 1000);
+    if (!list || list.length === 0) {
+      list = db.credit_notes.filter(cn => cn.store_id === storeId);
+    } else {
+      (db as any).cache.credit_notes = list;
+    }
+
+    if (options?.search) {
+      const q = options.search.trim().toLowerCase();
+      list = list.filter(cn =>
+        cn.credit_note_number.toLowerCase().includes(q) ||
+        cn.bill_number.toLowerCase().includes(q) ||
+        (cn.customer_name && cn.customer_name.toLowerCase().includes(q)) ||
+        (cn.customer_phone && cn.customer_phone.includes(q))
+      );
+    }
+
+    if (options?.from) {
+      const fromDate = new Date(options.from).getTime();
+      list = list.filter(cn => new Date(cn.created_at).getTime() >= fromDate);
+    }
+
+    if (options?.to) {
+      const toDate = new Date(options.to).getTime() + 86400000;
+      list = list.filter(cn => new Date(cn.created_at).getTime() <= toDate);
+    }
+
+    return list;
+  }
+
+  static async getCreditNoteById(storeId: string, id: string) {
+    let cn = db.credit_notes.find(c => c.id === id && c.store_id === storeId);
+    if (!cn) {
+      cn = await LocalDb.getCreditNoteById(id);
+    }
+    return cn;
   }
 }

@@ -1,4 +1,4 @@
-import { Sale, Store } from '../types';
+import { Sale, Store, CreditNote } from '../types';
 import { formatCurrency, formatDateTime, formatBillNumber } from './utils';
 import { api } from './api';
 
@@ -746,6 +746,258 @@ export function printTestReceipt(
     deviceName: deviceName,
     customSettings,
   });
+}
+
+export interface PrintCreditNoteOptions {
+  creditNote: CreditNote;
+  store: Store | null;
+  silent?: boolean;
+  deviceName?: string;
+  customSettings?: Partial<PrinterCustomizationSettings>;
+}
+
+/**
+ * Print customer refund voucher / credit note to thermal or standard printer.
+ */
+export function printCreditNoteReceipt({
+  creditNote,
+  store,
+  silent,
+  deviceName,
+  customSettings,
+}: PrintCreditNoteOptions): void {
+  const settings: PrinterCustomizationSettings = {
+    ...getPrinterSettings(),
+    ...(customSettings || {}),
+  };
+
+  const chosenFormat = settings.format || '80mm';
+  const isSilent = silent !== undefined ? silent : settings.directPrint;
+  const chosenDeviceName = deviceName || settings.deviceName || '';
+
+  // Setup dynamic @page stylesheet
+  let pageStyle = document.getElementById('dynamic-print-page');
+  if (!pageStyle) {
+    pageStyle = document.createElement('style');
+    pageStyle.id = 'dynamic-print-page';
+    document.head.appendChild(pageStyle);
+  }
+
+  if (chosenFormat === 'a4') {
+    pageStyle.innerHTML = '@page { size: A4 portrait; margin: 8mm; }';
+  } else if (chosenFormat === '58mm') {
+    pageStyle.innerHTML = '@page { size: 58mm auto; margin: 1mm; }';
+  } else if (chosenFormat === '80mm') {
+    pageStyle.innerHTML = '@page { size: 80mm auto; margin: 1.5mm; }';
+  } else {
+    pageStyle.innerHTML = '@page { size: auto; margin: 4mm; }';
+  }
+
+  document.body.classList.remove('print-format-58mm', 'print-format-80mm', 'print-format-a4', 'print-format-free');
+  document.body.classList.add(`print-format-${chosenFormat}`);
+
+  const isA4 = chosenFormat === 'a4';
+  const isFree = chosenFormat === 'free';
+  const containerWidth = isFree || isA4 ? '100%' : chosenFormat === '58mm' ? '54mm' : '76mm';
+  const baseFontSize = isA4 ? '12px' : chosenFormat === '58mm' ? '8.5px' : '9.5px';
+
+  let portal = document.getElementById('print-portal');
+  if (!portal) {
+    portal = document.createElement('div');
+    portal.id = 'print-portal';
+    document.body.appendChild(portal);
+  }
+
+  const storeName = settings.headerStoreNameOverride || store?.name || 'FryFreeze';
+  const itemsHtml = (creditNote.items || []).map((item, idx) => `
+    <tr style="border-bottom: 1px dotted #ccc;">
+      <td style="width: 50%; padding: 2px 0; vertical-align: top; text-align: left; word-break: break-word;">
+        <div style="font-weight: 600; color: #000; line-height: 1.25;">
+          ${idx + 1}. ${escapeHtml(item.product_name)}
+        </div>
+        ${item.restocked ? '<div style="font-size: 7.5px; color: #065f46;">[Restocked to inventory]</div>' : ''}
+      </td>
+      <td style="width: 15%; padding: 2px 2px; text-align: center; vertical-align: top; font-weight: 600;">
+        ${item.quantity_refunded}
+      </td>
+      <td style="width: 15%; padding: 2px 2px; text-align: right; vertical-align: top; white-space: nowrap;">
+        ${formatCurrency(item.unit_price)}
+      </td>
+      <td style="width: 20%; padding: 2px 0; text-align: right; vertical-align: top; font-weight: 700; white-space: nowrap;">
+        ${formatCurrency(item.refund_amount)}
+      </td>
+    </tr>
+  `).join('');
+
+  portal.innerHTML = `
+    <div style="
+      width: ${containerWidth};
+      max-width: ${containerWidth};
+      margin: 0 auto;
+      font-family: 'Courier New', Courier, monospace;
+      font-size: ${baseFontSize};
+      line-height: 1.25;
+      color: #000000;
+      background: #ffffff;
+      padding: 0;
+      box-sizing: border-box;
+      overflow: hidden;
+    ">
+      <!-- Store Header -->
+      <div style="text-align: center; margin-bottom: 4px;">
+        <div style="font-size: ${isA4 ? '16px' : '13px'}; font-weight: 900; letter-spacing: 0.5px; text-transform: uppercase;">
+          ${escapeHtml(storeName)}
+        </div>
+        ${store?.address ? `
+          <div style="font-size: 8.5px; color: #333; margin-top: 1px;">
+            ${escapeHtml(store.address)}
+          </div>
+        ` : ''}
+        ${store?.phone ? `
+          <div style="font-size: 8.5px; color: #333; margin-top: 1px;">
+            Ph: ${escapeHtml(store.phone)}
+          </div>
+        ` : ''}
+        ${store?.gstin ? `
+          <div style="font-size: 9.5px; font-weight: 700; margin-top: 1px;">
+            GSTIN: ${escapeHtml(store.gstin)}
+          </div>
+        ` : ''}
+      </div>
+
+      <!-- Title Divider -->
+      <div style="
+        border-top: 1px dashed #000;
+        border-bottom: 1px dashed #000;
+        text-align: center;
+        font-weight: 800;
+        padding: 3px 0;
+        margin: 4px 0;
+        font-size: ${isA4 ? '13px' : '10.5px'};
+        letter-spacing: 1px;
+      ">
+        *** CREDIT NOTE / REFUND VOUCHER ***
+      </div>
+
+      <!-- Metadata Section -->
+      <div style="padding-bottom: 3px; font-size: 9px;">
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: #666;">Credit Note #:</span>
+          <span style="font-weight: 800; font-family: monospace;">${escapeHtml(creditNote.credit_note_number)}</span>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: #666;">Original Bill #:</span>
+          <span style="font-weight: 700;">${escapeHtml(creditNote.bill_number)}</span>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: #666;">Date:</span>
+          <span>${escapeHtml(formatDateTime(creditNote.created_at))}</span>
+        </div>
+        ${creditNote.created_by_name ? `
+          <div style="display: flex; justify-content: space-between;">
+            <span style="color: #666;">Issued By:</span>
+            <span>${escapeHtml(creditNote.created_by_name)}</span>
+          </div>
+        ` : ''}
+        ${creditNote.customer_name ? `
+          <div style="display: flex; justify-content: space-between;">
+            <span style="color: #666;">Customer:</span>
+            <span style="font-weight: 600;">${escapeHtml(creditNote.customer_name)}</span>
+          </div>
+        ` : ''}
+      </div>
+
+      <!-- Refund Items Table -->
+      <table style="table-layout: fixed !important; width: 100% !important; border-collapse: collapse !important; font-size: inherit; border-top: 1px dashed #000;">
+        <colgroup>
+          <col style="width: 50%;" />
+          <col style="width: 15%;" />
+          <col style="width: 15%;" />
+          <col style="width: 20%;" />
+        </colgroup>
+        <thead>
+          <tr style="border-bottom: 1px dashed #444; font-weight: 700;">
+            <th style="width: 50%; text-align: left; padding: 3px 0;">REFUNDED ITEM</th>
+            <th style="width: 15%; text-align: center; padding: 3px 2px;">QTY</th>
+            <th style="width: 15%; text-align: right; padding: 3px 2px;">RATE</th>
+            <th style="width: 20%; text-align: right; padding: 3px 0;">AMOUNT</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${itemsHtml}
+        </tbody>
+      </table>
+
+      <!-- Totals Section -->
+      <div style="border-top: 1px dashed #000; padding: 3px 0; margin-top: 3px;">
+        <div style="
+          display: flex;
+          justify-content: space-between;
+          align-items: baseline;
+          font-weight: 800;
+          font-size: ${isA4 ? '14px' : '12px'};
+        ">
+          <span>TOTAL REFUND:</span>
+          <span style="font-variant-numeric: tabular-nums; white-space: nowrap;">${formatCurrency(creditNote.refund_amount)}</span>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 8.5px; color: #444; margin-top: 2px;">
+          <span>Refund Method:</span>
+          <span style="font-weight: 700;">${escapeHtml(creditNote.refund_method)}</span>
+        </div>
+        <div style="display: flex; justify-content: space-between; font-size: 8.5px; color: #444; margin-top: 2px;">
+          <span>Reason:</span>
+          <span style="font-style: italic;">${escapeHtml(creditNote.reason || 'Customer Request')}</span>
+        </div>
+      </div>
+
+      <!-- Footer & Signatures -->
+      <div style="border-top: 1px dashed #000; padding-top: 8px; margin-top: 8px; font-size: 8px; text-align: center;">
+        <div style="display: flex; justify-content: space-between; margin-top: 15px; padding: 0 4px;">
+          <div style="border-top: 1px solid #444; width: 45%; text-align: center; padding-top: 2px;">
+            Customer Signature
+          </div>
+          <div style="border-top: 1px solid #444; width: 45%; text-align: center; padding-top: 2px;">
+            Store Authorized Sign
+          </div>
+        </div>
+        <div style="font-weight: 800; font-size: 8.5px; margin-top: 8px; letter-spacing: 0.5px;">
+          *** OFFICIAL CREDIT NOTE RECORD ***
+        </div>
+      </div>
+
+      <div style="height: ${(settings.feedLines || 2) * 12}px;"></div>
+    </div>
+  `;
+
+  const prevTitle = document.title;
+  document.title = `CreditNote-${creditNote.credit_note_number}`;
+
+  setTimeout(() => {
+    try {
+      const electronAPI = (window as any).electronAPI;
+      if (electronAPI && typeof electronAPI.print === 'function') {
+        electronAPI.print({
+          silent: isSilent,
+          deviceName: chosenDeviceName,
+        });
+      } else {
+        window.print();
+      }
+    } catch (_) {
+      window.print();
+    }
+
+    setTimeout(() => {
+      document.title = prevTitle;
+      document.body.classList.remove('print-format-58mm', 'print-format-80mm', 'print-format-a4', 'print-format-free');
+      if (portal && portal.parentNode) {
+        portal.innerHTML = '';
+      }
+      if (pageStyle && pageStyle.parentNode) {
+        pageStyle.parentNode.removeChild(pageStyle);
+      }
+    }, 1200);
+  }, 100);
 }
 
 function escapeHtml(str: string): string {

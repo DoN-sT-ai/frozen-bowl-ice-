@@ -19,8 +19,9 @@ import { PublicVerificationPage } from './components/verify/PublicVerificationPa
 import { UpdateNotificationBanner } from './components/common/UpdateNotificationBanner';
 import { CashControlView } from './components/cash/CashControlView';
 import { CustomersView } from './components/customers/CustomersView';
+import { RefundsView } from './components/refunds/RefundsView';
 import { initPrinterSettingsSync } from './lib/printerService';
-import { X, Shield, Settings, Wallet, FileBarChart2, Users, ScrollText, Code, Banknote, UserCheck } from 'lucide-react';
+import { X, Shield, Settings, Wallet, FileBarChart2, Users, ScrollText, Code, Banknote, UserCheck, RotateCcw } from 'lucide-react';
 
 const MainLayout: React.FC = () => {
   const { user, loading, isAdmin, isDeveloper, quickLogin } = useAuth();
@@ -31,10 +32,10 @@ const MainLayout: React.FC = () => {
 
   // Compute allowed tabs for the current user
   const allowedTabIds = isAdmin
-    ? ['billing', 'inventory', 'movements', 'sales', 'cash_control', 'customers', 'dashboard', 'expenses', 'reports', 'employees', 'audit', 'settings', ...(isDeveloper ? ['developer'] : [])]
+    ? ['billing', 'inventory', 'movements', 'sales', 'refunds', 'cash_control', 'customers', 'dashboard', 'expenses', 'reports', 'employees', 'audit', 'settings', ...(isDeveloper ? ['developer'] : [])]
     : user?.permissions && user.permissions.length > 0
     ? user.permissions
-    : ['billing', 'inventory', 'sales', 'movements', 'cash_control', 'customers'];
+    : ['billing', 'inventory', 'sales', 'refunds', 'movements', 'cash_control', 'customers'];
 
   // Check query parameter for ?verify=TOKEN on mount
   useEffect(() => {
@@ -73,20 +74,23 @@ const MainLayout: React.FC = () => {
           setCurrentTab('sales');
         } else if (e.key === '4') {
           e.preventDefault();
-          setCurrentTab('movements');
+          setCurrentTab('refunds');
         } else if (e.key === '5') {
           e.preventDefault();
-          setCurrentTab('cash_control');
+          setCurrentTab('movements');
         } else if (e.key === '6') {
           e.preventDefault();
-          setCurrentTab('customers');
+          setCurrentTab('cash_control');
         } else if (e.key === '7') {
           e.preventDefault();
-          setCurrentTab('expenses');
+          setCurrentTab('customers');
         } else if (e.key === '8') {
           e.preventDefault();
+          setCurrentTab('expenses');
+        } else if (e.key === '9') {
+          e.preventDefault();
           setCurrentTab('reports');
-        } else if (isAdmin && e.key === '9') {
+        } else if (isAdmin && (e.key === '0' || e.key === 's')) {
           e.preventDefault();
           setCurrentTab('settings');
         }
@@ -149,6 +153,7 @@ const MainLayout: React.FC = () => {
           {currentTab === 'inventory' && <InventoryManager />}
           {currentTab === 'movements' && <StockMovementsList />}
           {currentTab === 'sales' && <BillHistory />}
+          {currentTab === 'refunds' && (isAdmin || allowedTabIds.includes('refunds')) && <RefundsView />}
           {currentTab === 'cash_control' && <CashControlView />}
           {currentTab === 'customers' && (isAdmin || allowedTabIds.includes('customers')) && <CustomersView />}
 
@@ -189,6 +194,19 @@ const MainLayout: React.FC = () => {
             </div>
 
             <div className="grid grid-cols-2 gap-2 text-xs">
+              {allowedTabIds.includes('refunds') && (
+                <button
+                  onClick={() => {
+                    setCurrentTab('refunds');
+                    setShowMobileMore(false);
+                  }}
+                  className="p-3 bg-neutral-50 rounded border border-neutral-200 text-left font-medium flex items-center gap-2"
+                >
+                  <RotateCcw className="w-4 h-4 text-red-600" />
+                  Customer Refunds
+                </button>
+              )}
+
               {allowedTabIds.includes('cash_control') && (
                 <button
                   onClick={() => {

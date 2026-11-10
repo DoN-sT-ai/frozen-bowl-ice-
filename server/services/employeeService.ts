@@ -90,7 +90,7 @@ export class EmployeeService {
     }
 
     const currentStore = (await LocalDb.getStore(storeId)) || (await LocalDb.getFirstStore());
-    const storeName = currentStore?.name || 'Frozen Bowl';
+    const storeName = currentStore?.name || 'FryFreeze';
     const saved = await SupabaseDb.createUser(newEmp, storeName);
     AuditService.log({
       storeId, userId: adminUserId, userName: adminUserName,

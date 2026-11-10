@@ -366,6 +366,47 @@ export class CashControlService {
   }
 
   /**
+   * Record a CASH refund / Credit Note payout in the active drawer session.
+   */
+  static async recordRefundIfSessionOpen(
+    storeId: string,
+    creditNote: { id: string; credit_note_number: string; bill_number: string; refund_amount: number; refund_method: string; reason: string },
+    userId: string,
+    userName: string
+  ): Promise<void> {
+    if (creditNote.refund_method !== 'CASH') return;
+
+    try {
+      const session = await LocalDb.getActiveCashDrawerSession(storeId);
+      if (!session) return;
+
+      const refundAmount = Number(creditNote.refund_amount) || 0;
+      const newCashSales = Number((Number(session.cash_sales_amount || 0) - refundAmount).toFixed(2));
+      const newExpected = Number((Number(session.expected_amount || 0) - refundAmount).toFixed(2));
+
+      await LocalDb.updateCashDrawerSession(session.id, {
+        cash_sales_amount: newCashSales,
+        expected_amount: newExpected,
+      });
+
+      await LocalDb.createCashDrawerTransaction({
+        session_id: session.id,
+        store_id: storeId,
+        type: 'REFUND',
+        amount: -refundAmount,
+        category: 'Cash Refund',
+        reason: `Credit Note #${creditNote.credit_note_number} (Bill #${creditNote.bill_number}): ${creditNote.reason || 'Customer refund'}`,
+        reference_id: creditNote.id,
+        performed_by: userId,
+        performed_by_name: userName || 'Cashier',
+        notes: `Credit Note #${creditNote.credit_note_number}`,
+      });
+    } catch (err) {
+      console.error('[CashControl] Error recording credit note cash refund to drawer session:', err);
+    }
+  }
+
+  /**
    * End shift and close the cash drawer with actual physical denomination count.
    */
   static async closeSession(
