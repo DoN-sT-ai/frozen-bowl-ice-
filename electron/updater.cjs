@@ -597,15 +597,16 @@ if (Test-Path -LiteralPath $InstallerPath) {
 }
 
 # 5. Grace period before verifying relaunch
-Start-Sleep -Milliseconds 2000
+Start-Sleep -Milliseconds 2500
 
-# 6. Fallback relaunch (only if --force-run did not already start the app)
+# 6. Fallback relaunch via Win32_Process (completely detached root process)
 $running = Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue
 if (-not $running) {
   if (Test-Path -LiteralPath $AppExePath) {
-    Log-Msg "Fallback relaunching FryFreeze at: $AppExePath"
-    Start-Process -FilePath $AppExePath
-    Log-Msg "Application launch command invoked"
+    Log-Msg "Fallback launching FryFreeze via Win32_Process at: $AppExePath"
+    $escaped = '"{0}"' -f $AppExePath
+    $res = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $escaped }
+    Log-Msg "Win32_Process.Create result: ReturnValue=$($res.ReturnValue), ProcessId=$($res.ProcessId)"
   } else {
     Log-Msg "ERROR: AppExePath not found: $AppExePath"
   }
@@ -641,10 +642,18 @@ Log-Msg "=== Update runner finished ==="
     );
     child.unref();
 
-    // Immediately terminate Electron to release all file descriptors and binaries
-    setImmediate(() => {
-      app.exit(0);
-    });
+    // Ensure the detached PowerShell process is active before closing Electron
+    let exited = false;
+    const safeExit = () => {
+      if (exited) return;
+      exited = true;
+      setTimeout(() => {
+        app.exit(0);
+      }, 400);
+    };
+
+    child.on('spawn', safeExit);
+    setTimeout(safeExit, 1200);
 
     return { success: true };
   } catch (err) {
