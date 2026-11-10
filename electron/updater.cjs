@@ -14,7 +14,6 @@
 // • Local SQLite databases in userData directory are NEVER touched or overwritten.
 // ============================================================================
 
-const { autoUpdater } = require('electron-updater');
 const { ipcMain, app } = require('electron');
 const https = require('https');
 const http = require('http');
@@ -29,10 +28,6 @@ let downloadedInstallerPath = null;
 let activeDownloadPromise = null;
 let maxReportedPercent = 0;
 let lastCheckingTimestamp = 0;
-
-// Configure electron-updater (manual download control to prevent racing dual downloaders)
-autoUpdater.autoDownload = false;
-autoUpdater.autoInstallOnAppQuit = false;
 
 function getSupabaseConfig() {
   const url = process.env.SUPABASE_URL || 'https://qruqelexhfgqmdlsrlug.supabase.co';
@@ -592,25 +587,30 @@ Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue | Stop-Process -Forc
 # 3. Grace period for Windows file locks
 Start-Sleep -Milliseconds 1000
 
-# 4. Run NSIS installer silently
+# 4. Run NSIS installer silently with auto-relaunch (--force-run)
 if (Test-Path -LiteralPath $InstallerPath) {
-  Log-Msg "Executing NSIS installer silently..."
-  $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated" -PassThru -Wait
+  Log-Msg "Executing NSIS installer silently with auto-relaunch..."
+  $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated", "--force-run" -PassThru -Wait
   Log-Msg "Installer process finished with exit code: $($p.ExitCode)"
 } else {
   Log-Msg "ERROR: Installer path not found: $InstallerPath"
 }
 
-# 5. Grace period before relaunching
-Start-Sleep -Milliseconds 1000
+# 5. Grace period before verifying relaunch
+Start-Sleep -Milliseconds 2000
 
-# 6. Relaunch application
-if (Test-Path -LiteralPath $AppExePath) {
-  Log-Msg "Relaunching FryFreeze at: $AppExePath"
-  Start-Process -FilePath $AppExePath
-  Log-Msg "Application launch command invoked"
+# 6. Fallback relaunch (only if --force-run did not already start the app)
+$running = Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue
+if (-not $running) {
+  if (Test-Path -LiteralPath $AppExePath) {
+    Log-Msg "Fallback relaunching FryFreeze at: $AppExePath"
+    Start-Process -FilePath $AppExePath
+    Log-Msg "Application launch command invoked"
+  } else {
+    Log-Msg "ERROR: AppExePath not found: $AppExePath"
+  }
 } else {
-  Log-Msg "ERROR: AppExePath not found: $AppExePath"
+  Log-Msg "FryFreeze already running via installer. PIDs: $($running.Id -join ', ')"
 }
 Log-Msg "=== Update runner finished ==="
 `;
