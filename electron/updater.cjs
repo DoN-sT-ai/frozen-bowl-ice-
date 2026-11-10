@@ -29,6 +29,22 @@ let activeDownloadPromise = null;
 let maxReportedPercent = 0;
 let lastCheckingTimestamp = 0;
 
+function logUpdater(msg) {
+  try {
+    const time = new Date().toISOString();
+    const line = `[${time}] [AutoUpdater] ${msg}\n`;
+    console.log(line.trim());
+    const userDataPath = app?.getPath ? app.getPath('userData') : null;
+    if (userDataPath) {
+      const updateDir = path.join(userDataPath, 'pending-update');
+      if (!fs.existsSync(updateDir)) {
+        fs.mkdirSync(updateDir, { recursive: true });
+      }
+      fs.appendFileSync(path.join(updateDir, 'update.log'), line, 'utf8');
+    }
+  } catch (_) {}
+}
+
 function getSupabaseConfig() {
   const url = process.env.SUPABASE_URL || 'https://qruqelexhfgqmdlsrlug.supabase.co';
   const key = process.env.SUPABASE_ANON_KEY || 'sb_publishable_V5urSBDQ03O0YT2fL0BRGQ_wr7iec55';
@@ -383,6 +399,7 @@ async function downloadRelease(filename, version, expectedSha512, totalSize) {
         total: totalSize,
       });
 
+      logUpdater(`Update v${version} successfully downloaded and verified at: ${destPath}`);
       sendToWindow('updater:status', {
         status: 'downloaded',
         version,
@@ -415,6 +432,7 @@ async function checkForUpdates() {
   }
   lastCheckingTimestamp = now;
 
+  logUpdater(`Checking for updates... Current installed version: v${app.getVersion()}`);
   sendToWindow('updater:status', {
     status: 'checking',
     message: 'Checking for updates in Supabase Cloud...',
@@ -473,6 +491,7 @@ async function checkForUpdates() {
   }
 
   if (!isNewerVersion(remoteVersion, currentVersion)) {
+    logUpdater(`App is up to date: v${currentVersion} (remote: v${remoteVersion})`);
     sendToWindow('updater:status', {
       status: 'not-available',
       version: currentVersion,
@@ -482,7 +501,7 @@ async function checkForUpdates() {
   }
 
   // Newer version is available!
-  console.log(`[AutoUpdater] Newer version detected: v${remoteVersion} (current: v${currentVersion})`);
+  logUpdater(`Newer version detected: v${remoteVersion} (current: v${currentVersion}). Initiating download...`);
   sendToWindow('updater:status', {
     status: 'available',
     version: remoteVersion,
@@ -491,7 +510,7 @@ async function checkForUpdates() {
 
   // Start smooth background download
   downloadRelease(remoteFile, remoteVersion, expectedSha512, expectedSize).catch((err) => {
-    console.error('[AutoUpdater] Background download failed:', err.message);
+    logUpdater(`Background download failed: ${err.message}`);
   });
 
   return { success: true, updateAvailable: true, version: remoteVersion };
@@ -521,7 +540,7 @@ ipcMain.handle('updater:check', async () => {
 
 ipcMain.handle('updater:install', async () => {
   try {
-    console.log('[AutoUpdater] Restart & Update requested...');
+    logUpdater('Restart & Update requested by user...');
 
     let installerPath = downloadedInstallerPath;
     const updateDir = path.join(app.getPath('userData'), 'pending-update');
@@ -543,17 +562,18 @@ ipcMain.handle('updater:install', async () => {
       throw new Error('Downloaded installer file appears incomplete.');
     }
 
-    console.log(`[AutoUpdater] Executing silent Windows update via runner: ${installerPath}`);
+    logUpdater(`Executing silent Windows update via runner: ${installerPath} (${(stat.size / 1024 / 1024).toFixed(1)} MB)`);
 
     const targetPid = process.pid;
     const currentExe = process.execPath;
     const runnerScriptPath = path.join(updateDir, 'apply-update.ps1');
+    const runnerCmdPath = path.join(updateDir, 'run-update.cmd');
 
     // Dedicated PowerShell update runner with native progress indicator window:
     // 1. Shows a sleek centered dialog indicating the update is being extracted and applied.
     // 2. Monitors calling process PID and waits until it exits.
     // 3. Kills any lingering child processes so Windows releases all executable file locks.
-    // 4. Executes NSIS silently with /S --updated --force-run while updating the status message.
+    // 4. Executes NSIS silently with /S --updated --force-run while pumping UI events.
     // 5. Verifies relaunch via Win32_Process fallback and closes the progress window.
     const runnerScriptContent = `
 param(
@@ -611,12 +631,14 @@ $form.Controls.Add($progressBar)
 
 $form.Show()
 $form.Refresh()
+[System.Windows.Forms.Application]::DoEvents()
 
 # 2. Wait for caller process to exit
 $waitCount = 0
 while ((Get-Process -Id $TargetPid -ErrorAction SilentlyContinue) -and ($waitCount -lt 40)) {
   Start-Sleep -Milliseconds 250
   $form.Refresh()
+  [System.Windows.Forms.Application]::DoEvents()
   $waitCount++
 }
 Log-Msg "Target process $TargetPid exited (waited $($waitCount * 250)ms)"
@@ -626,15 +648,23 @@ Log-Msg "Terminating lingering FryFreeze processes..."
 Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 # 4. Grace period for Windows file locks
-Start-Sleep -Milliseconds 1000
-$form.Refresh()
+for ($i = 0; $i -lt 5; $i++) {
+  Start-Sleep -Milliseconds 200
+  [System.Windows.Forms.Application]::DoEvents()
+}
 
 # 5. Run NSIS installer silently with auto-relaunch (--force-run)
 if (Test-Path -LiteralPath $InstallerPath) {
   Log-Msg "Executing NSIS installer silently with auto-relaunch..."
   $labelDesc.Text = "Extracting files and applying update... Please wait."
   $form.Refresh()
-  $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated", "--force-run" -PassThru -Wait
+  [System.Windows.Forms.Application]::DoEvents()
+
+  $p = Start-Process -FilePath $InstallerPath -ArgumentList "/S", "--updated", "--force-run" -PassThru
+  while (-not $p.HasExited) {
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.Application]::DoEvents()
+  }
   Log-Msg "Installer process finished with exit code: $($p.ExitCode)"
 } else {
   Log-Msg "ERROR: Installer path not found: $InstallerPath"
@@ -643,7 +673,10 @@ if (Test-Path -LiteralPath $InstallerPath) {
 # 6. Grace period before verifying relaunch
 $labelDesc.Text = "Relaunching FryFreeze POS..."
 $form.Refresh()
-Start-Sleep -Milliseconds 2500
+for ($i = 0; $i -lt 12; $i++) {
+  Start-Sleep -Milliseconds 200
+  [System.Windows.Forms.Application]::DoEvents()
+}
 
 # 7. Fallback relaunch via Win32_Process (completely detached root process)
 $running = Get-Process -Name "FryFreeze" -ErrorAction SilentlyContinue
@@ -666,22 +699,15 @@ $form.Close()
 
     fs.writeFileSync(runnerScriptPath, runnerScriptContent.trim(), 'utf8');
 
-    // Spawn detached PowerShell runner
+    // Create a standalone batch runner to ensure 100% process detachment from Node on Windows
+    const runnerCmdContent = `@echo off\r\npowershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0apply-update.ps1" -TargetPid %1 -InstallerPath "%~2" -AppExePath "%~3"\r\n`;
+    fs.writeFileSync(runnerCmdPath, runnerCmdContent, 'utf8');
+
+    logUpdater(`Spawning detached update runner batch script: ${runnerCmdPath}`);
+
     const child = spawn(
-      'powershell.exe',
-      [
-        '-NoProfile',
-        '-ExecutionPolicy',
-        'Bypass',
-        '-File',
-        runnerScriptPath,
-        '-TargetPid',
-        String(targetPid),
-        '-InstallerPath',
-        installerPath,
-        '-AppExePath',
-        currentExe,
-      ],
+      'cmd.exe',
+      ['/c', 'start', '""', '/b', runnerCmdPath, String(targetPid), installerPath, currentExe],
       {
         detached: true,
         stdio: 'ignore',
@@ -690,22 +716,25 @@ $form.Close()
     );
     child.unref();
 
-    // Ensure the detached PowerShell process is active before closing Electron
-    let exited = false;
-    const safeExit = () => {
-      if (exited) return;
-      exited = true;
-      setTimeout(() => {
-        app.exit(0);
-      }, 400);
-    };
+    logUpdater('Runner spawned successfully. Explicitly releasing single instance lock...');
 
-    child.on('spawn', safeExit);
-    setTimeout(safeExit, 1200);
+    if (app.releaseSingleInstanceLock) {
+      try {
+        app.releaseSingleInstanceLock();
+        logUpdater('Single instance lock released.');
+      } catch (e) {
+        logUpdater(`Note releasing lock: ${e.message}`);
+      }
+    }
+
+    setTimeout(() => {
+      logUpdater('Closing app via app.exit(0)');
+      app.exit(0);
+    }, 600);
 
     return { success: true };
   } catch (err) {
-    console.error('[AutoUpdater] Install invocation failed:', err);
+    logUpdater(`Install invocation failed: ${err.message}`);
     sendToWindow('updater:status', {
       status: 'error',
       message: `Installation failed: ${err.message}`,
